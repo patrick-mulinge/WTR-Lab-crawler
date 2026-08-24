@@ -1,7 +1,7 @@
 # Personal WTR-Lab local worker
 
 Download novels from **wtr-lab.com** on **your own PC**.  
-Tasks are stored in a **local SQLite file** on that machine — not in anyone else’s database.
+Tasks are stored in a **local SQLite file** on that machine.
 
 Telegram is only used to:
 
@@ -13,7 +13,7 @@ Inspired by [WebToEpub](https://github.com/dteviot/WebToEpub) and [lightnovel-cr
 
 ## Requirements
 
-- Windows, macOS, or Linux  
+- Windows, still testing on macOS and Linux  
 - Python 3.10+  
 - Google Chrome installed  
 - A Telegram account  
@@ -23,7 +23,7 @@ Inspired by [WebToEpub](https://github.com/dteviot/WebToEpub) and [lightnovel-cr
 
 ### Windows
 
-1. Open the `wtrlab-local-standalone` folder.  
+1. Open the `wtrlab-local-standalone` folder, it is recommended that the folder should be on Local disk C, eg. downloads or desktop, not on external drives.  
 2. **Unblock the scripts** (Windows often blocks files from the internet / zip / chat):  
    - Right-click **`Start for Windows.bat`** → **Properties** → check **Unblock** → **OK**  
    - Right-click **`start-windows.ps1`** → **Properties** → check **Unblock** → **OK**  
@@ -51,7 +51,7 @@ Inspired by [WebToEpub](https://github.com/dteviot/WebToEpub) and [lightnovel-cr
 
 To force full setup again, delete `data/.setup_done` and/or `.env`, then run `Start for Windows.bat` again.
 
-### macOS / Linux
+### macOS / Linux --still under testing
 
 ```bash
 chmod +x "Start for Linux.sh"
@@ -59,11 +59,6 @@ chmod +x "Start for Linux.sh"
 ```
 
 Same guided setup, then starts the app.
-
-### Optional: auto-download from GitHub
-
-If you publish this repo, set the zip URL inside `start-windows.ps1` / `Start for Linux.sh` (`$GithubZipUrl` / `GITHUB_ZIP_URL`).  
-If `app.py` is missing, the script can download the project automatically. Leave the URL empty if you always ship the full folder.
 
 ### Config reference (written by the script into `.env`)
 
