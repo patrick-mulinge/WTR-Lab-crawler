@@ -29,7 +29,7 @@ desktop.ini
 *.log
 .idea/
 .vscode/
-
+downloaded_files/
 # Build / temp
 *.tmp
 *.epub.tmp
