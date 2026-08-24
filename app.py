@@ -69,8 +69,13 @@ ALLOWED_USER_IDS = parse_id_list(os.environ.get("ALLOWED_USER_IDS", ""))
 # Admins: immune to CHAPTER_CAP and DAILY_TASK_LIMIT. Comma/space separated.
 ADMIN_USER_IDS = parse_id_list(os.environ.get("ADMIN_USER_IDS", ""))
 
-# Optional chat that receives a *copy* of finished books (not an admin privilege).
+# Optional chat that receives a *copy* of finished books.
+# If it is a numeric user id and ADMIN_USER_IDS was empty, treat it as admin too
+# (common personal-bot setup: only ADMIN_CHAT_ID is set).
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "").strip()
+if not ADMIN_USER_IDS and ADMIN_CHAT_ID.lstrip("-").isdigit():
+    ADMIN_USER_IDS.add(int(ADMIN_CHAT_ID))
+
 OUTPUT_GROUPS = [
     item.strip()
     for item in os.environ.get("OUTPUT_GROUPS", "").split(",")
@@ -370,14 +375,21 @@ def normalize_novel_url(url: str) -> str:
 
 
 def count_recent_tasks(user_id: int, hours: int = 24) -> int:
-    """Count tasks that consume daily quota (not pure retries of failures)."""
+    """
+    Count tasks that consume the daily quota.
+    Includes failed so a mid-download failure still holds the slot for *new*
+    novels; same-link resume is allowed separately via is_same_link_retry().
+    """
     conn = local_db()
     try:
         row = conn.execute(
             """
             SELECT COUNT(*) AS c FROM tasks
             WHERE user_id = ?
-              AND status IN ('pending', 'running', 'done', 'upload_failed')
+              AND status IN (
+                  'pending', 'running', 'done',
+                  'failed', 'upload_failed'
+              )
               AND created_at >= datetime('now', ?)
             """,
             (user_id, f"-{hours} hours"),
@@ -438,9 +450,11 @@ def insert_task(
         used = count_recent_tasks(user_id)
         if used >= DAILY_TASK_LIMIT:
             return None, (
-                f"Daily limit reached ({DAILY_TASK_LIMIT} task(s) / 24h). "
-                "You can still re-send a novel you already started today "
-                "(failed/partial) to resume from cache. New novels must wait."
+                f"Daily limit reached ({DAILY_TASK_LIMIT} task(s) / 24h).\n"
+                "A different novel is blocked while that slot is used.\n"
+                "• Resend the same failed/partial link to resume from cache, or\n"
+                "• Use /continue to re-queue your latest failed task.\n"
+                "New novels must wait until the 24h window resets."
             )
 
     chapter_range = apply_range_cap(chapter_range, unlimited=unlimited_cap)
@@ -2563,17 +2577,24 @@ def process_task(task: dict, browser: WtrBrowser):
             except ChapterLocked:
                 last_ok = chapter.order - 1
                 if completed > 0 and last_ok >= start:
-                    sent = send_partial_if_possible(
+                    # Partial → failed (not done) so same-link resume stays free
+                    # and a different novel still hits the daily limit.
+                    send_partial_if_possible(
                         (
                             f"🔓 Stopped at chapter {chapter.order}: it is still "
                             f"AI-locked on WTR-Lab.\n"
                             f"Sending unlocked chapters {start}–{last_ok} "
-                            f"({unlocked_cap}/{total_listed} unlocked)."
+                            f"({unlocked_cap}/{total_listed} unlocked).\n\n"
+                            "📌 Resend the same link (or /continue) to resume "
+                            "from cache. A different novel is blocked until "
+                            "this slot frees or 24h pass."
                         )
                     )
-                    if sent:
-                        mark_done(task_id)
-                        return
+                    mark_failed(
+                        task_id,
+                        f"AI-locked at chapter {chapter.order}",
+                    )
+                    return
                 raise
 
             atomic_write_text(xhtml_path, xhtml)
@@ -2643,35 +2664,44 @@ def process_task(task: dict, browser: WtrBrowser):
     except DeadBrowser:
         print(f"[DEAD BROWSER] Task {task_id}")
         send_partial_if_possible(
-            "⚠️ Chrome closed or the session died. "
-            "Sending any chapters already cached. The worker will reopen Chrome and retry the rest."
+            "⚠️ Chrome closed or the session died.\n"
+            "Sending any chapters already cached.\n\n"
+            "📌 Resend the same link (or /continue) to resume. "
+            "The worker will reopen Chrome and continue from cache."
         )
+        mark_failed(task_id, "Chrome session died")
         raise
 
     except Exception as error:
         print(f"[WTR TASK ERROR] task={task_id}: {type(error).__name__}: {error}")
         reason = user_facing_error(error)
 
-        if send_partial_if_possible(
-            f"⚠️ Download stopped: {reason}\n\nSending the chapters already cached."
-        ):
-            mark_done(task_id)
-            return
+        partial_sent = send_partial_if_possible(
+            (
+                f"⚠️ Download stopped: {reason}\n\n"
+                "Sending the chapters already cached.\n\n"
+                "📌 Resend the same link (or /continue) to resume from cache. "
+                "A different novel is blocked while this failed task holds "
+                "your daily slot."
+            )
+        )
 
-        if progress:
+        if progress and not partial_sent:
             edit_progress(progress, f"⚠️ WTR-Lab download failed.\n\n{reason}")
 
-        telegram_call(
-            bot.send_message,
-            chat_id,
-            (
-                f"⚠️ WTR-Lab could not complete this task.\n\n"
-                f"{reason}\n\n"
-                "Cached chapters stay on the worker. Retry the same novel to continue."
-            ),
-            disable_web_page_preview=True,
-        )
-        mark_failed(task_id)
+        if not partial_sent:
+            telegram_call(
+                bot.send_message,
+                chat_id,
+                (
+                    f"⚠️ WTR-Lab could not complete this task.\n\n"
+                    f"{reason}\n\n"
+                    "Cached chapters stay on disk.\n"
+                    "📌 Resend the same novel link (or /continue) to resume."
+                ),
+                disable_web_page_preview=True,
+            )
+        mark_failed(task_id, reason)
     finally:
         browser.on_status = None
 
@@ -2708,6 +2738,13 @@ def cmd_start(message):
         if cap > 0
         else "• Chapter cap: none (full novel allowed)\n"
     )
+    admin_line = ""
+    if is_admin(message.from_user.id):
+        admin_line = (
+            "\n<b>Admin</b>\n"
+            "/logs — task logs with user details\n"
+            "/trial — all tasks in table\n"
+        )
     bot.reply_to(
         message,
         "📚 <b>Personal WTR-Lab downloader</b>\n\n"
@@ -2716,13 +2753,248 @@ def cmd_start(message):
         "<b>Commands</b>\n"
         "/download — queue a wtr-lab.com novel\n"
         "/queue — your pending/running tasks\n"
+        "/mytasks — your recent tasks (any status)\n"
+        "/continue — re-queue your latest failed task\n"
         "/cancel — cancel your pending/running tasks\n"
-        "/cap — show chapter cap\n\n"
+        "/status — worker status\n"
+        "/cap — show chapter cap\n"
+        f"{admin_line}\n"
         f"{limit_line}"
-        f"{cap_line}\n"
+        f"{cap_line}"
+        "Failed/partial downloads: resend the <b>same</b> link or /continue "
+        "to resume from cache. A different novel is blocked while that slot "
+        "is used.\n\n"
         "Only links from <code>wtr-lab.com</code> are accepted.",
         parse_mode="HTML",
     )
+
+
+@bot.message_handler(commands=["status"])
+def cmd_status(message):
+    if deny_if_needed(message):
+        return
+    cap = get_chapter_cap()
+    bot.reply_to(
+        message,
+        (
+            "🖥 <b>WTR local worker</b>\n"
+            f"SQLite: <code>{html.escape(str(SQLITE_PATH))}</code>\n"
+            f"Chapter cap: {'unlimited' if cap <= 0 else cap}\n"
+            f"Daily task limit: "
+            f"{'none' if DAILY_TASK_LIMIT <= 0 else DAILY_TASK_LIMIT}\n"
+            f"Throttle: {CHAPTER_THROTTLE_MIN:.0f}–{CHAPTER_THROTTLE_MAX:.0f}s"
+        ),
+        parse_mode="HTML",
+    )
+
+
+def _send_long_text(chat_id, text: str):
+    """Split long listings to stay under Telegram's message limit."""
+    text = text or ""
+    if not text:
+        return
+    max_len = 4000
+    while text:
+        chunk = text[:max_len]
+        text = text[max_len:]
+        try:
+            bot.send_message(chat_id, chunk, disable_web_page_preview=True)
+        except Exception as error:
+            print(f"[SEND LONG TEXT ERROR] {error}")
+            break
+
+
+@bot.message_handler(commands=["mytasks", "tasks"])
+def cmd_mytasks(message):
+    """Same layout as reference /trial, limited to the calling user."""
+    if deny_if_needed(message):
+        return
+    conn = local_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, user_id, username, status, url, chapter_range,
+                   novel_title, created_at, completed_at
+            FROM tasks
+            WHERE user_id = ?
+            ORDER BY id ASC
+            """,
+            (message.from_user.id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        bot.reply_to(message, "ℹ️ Queue is empty.")
+        return
+
+    text = "📋 All trial in Table:\n\n"
+    for t in rows:
+        text += (
+            f"🆔 Task ID: {t['id']}\n"
+            f"👤 User ID: {t['user_id']}\n"
+            f"🖥 Server: local\n"
+            f"⚙️ Crawler: wtr_local\n"
+            f"📌 Status: {t['status']}\n"
+            f"🌐 URL: {t['url']}\n"
+            f"📖 Range: {t['chapter_range']}\n"
+            f"🕒 Created: {t['created_at']}\n"
+            f"✅ Completed: {t['completed_at'] or 'Not completed'}\n"
+            f"------------------------------\n"
+        )
+    _send_long_text(message.chat.id, text)
+
+
+@bot.message_handler(commands=["continue"])
+def cmd_continue(message):
+    """Re-queue latest failed / upload_failed task for this user."""
+    if deny_if_needed(message):
+        return
+    uid = message.from_user.id
+    conn = local_db()
+    try:
+        active = conn.execute(
+            """
+            SELECT id FROM tasks
+            WHERE user_id = ? AND status IN ('pending', 'running')
+            LIMIT 1
+            """,
+            (uid,),
+        ).fetchone()
+        if active:
+            bot.reply_to(
+                message,
+                f"⚠️ You already have task #{active['id']} pending/running. "
+                "Wait or /cancel first.",
+            )
+            return
+
+        row = conn.execute(
+            """
+            SELECT id, url, novel_title, chapter_range, status
+            FROM tasks
+            WHERE user_id = ?
+              AND status IN ('failed', 'upload_failed')
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (uid,),
+        ).fetchone()
+        if not row:
+            bot.reply_to(
+                message,
+                "ℹ️ No failed task to continue. Use /download for a new novel.",
+            )
+            return
+
+        conn.execute(
+            """
+            UPDATE tasks
+            SET status = 'pending',
+                completed_at = NULL,
+                error = NULL
+            WHERE id = ? AND status IN ('failed', 'upload_failed')
+            """,
+            (row["id"],),
+        )
+        conn.commit()
+        title = row["novel_title"] or row["url"]
+        bot.reply_to(
+            message,
+            f"✅ Re-queued task #{row['id']} [{row['status']}→pending]\n"
+            f"📖 {title}\n"
+            f"🔍 Range: {row['chapter_range']}\n\n"
+            "Worker will resume from cached chapters shortly.",
+        )
+    finally:
+        conn.close()
+
+
+@bot.message_handler(commands=["logs"])
+def cmd_logs(message):
+    """Admin: same layout as reference /logs (with user details)."""
+    if deny_if_needed(message):
+        return
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Access Denied.")
+        return
+    conn = local_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, user_id, username, status, url, chapter_range,
+                   novel_title, created_at, completed_at
+            FROM tasks
+            ORDER BY id ASC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        bot.reply_to(message, "ℹ️ No task logs found.")
+        return
+
+    text = "📜 Task Logs (with user details):\n\n"
+    for t in rows:
+        username = f"@{t['username']}" if t["username"] else "N/A"
+        text += (
+            f"🆔 Task ID: {t['id']}\n"
+            f"👤 User ID: {t['user_id']}\n"
+            f"🔗 Username: {username}\n"
+            f"📛 Name: N/A N/A\n"
+            f"🖥 Server: local\n"
+            f"⚙️ Crawler: wtr_local\n"
+            f"📌 Status: {t['status']}\n"
+            f"🌐 URL: {t['url']}\n"
+            f"📖 Range: {t['chapter_range']}\n"
+            f"🕒 Created: {t['created_at']}\n"
+            f"✅ Completed: {t['completed_at'] or 'Not completed'}\n"
+            f"-----------------------------\n"
+        )
+    _send_long_text(message.chat.id, text)
+
+
+@bot.message_handler(commands=["trial"])
+def cmd_trial(message):
+    """Same layout as reference /trial — full task table."""
+    if deny_if_needed(message):
+        return
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "❌ Access Denied.")
+        return
+    conn = local_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, user_id, username, status, url, chapter_range,
+                   novel_title, created_at, completed_at
+            FROM tasks
+            ORDER BY id ASC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        bot.reply_to(message, "ℹ️ Queue is empty.")
+        return
+
+    text = "📋 All trial in Table:\n\n"
+    for t in rows:
+        text += (
+            f"🆔 Task ID: {t['id']}\n"
+            f"👤 User ID: {t['user_id']}\n"
+            f"🖥 Server: local\n"
+            f"⚙️ Crawler: wtr_local\n"
+            f"📌 Status: {t['status']}\n"
+            f"🌐 URL: {t['url']}\n"
+            f"📖 Range: {t['chapter_range']}\n"
+            f"🕒 Created: {t['created_at']}\n"
+            f"✅ Completed: {t['completed_at'] or 'Not completed'}\n"
+            f"------------------------------\n"
+        )
+    _send_long_text(message.chat.id, text)
 
 
 @bot.message_handler(commands=["cap"])
@@ -2747,21 +3019,42 @@ def cmd_cap(message):
 
 @bot.message_handler(commands=["queue"])
 def cmd_queue(message):
+    """Same layout as reference /queue — pending tasks."""
     if deny_if_needed(message):
         return
-    rows = list_user_queue(message.from_user.id)
+    conn = local_db()
+    try:
+        # Match reference: global pending queue (this PC is the only worker).
+        rows = conn.execute(
+            """
+            SELECT id, user_id, username, status, url, chapter_range,
+                   novel_title, created_at
+            FROM tasks
+            WHERE status = 'pending'
+            ORDER BY id ASC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
     if not rows:
         bot.reply_to(message, "ℹ️ Queue is empty.")
         return
-    lines = ["📋 Your queue:\n"]
-    for r in rows:
-        title = r.get("novel_title") or "(scanning…)"
-        lines.append(
-            f"#{r['id']} [{r['status']}] {title}\n"
-            f"  {r['url']}\n"
-            f"  range: {r['chapter_range']}\n"
+
+    text = "📋 Pending trial Queue:\n\n"
+    for t in rows:
+        text += (
+            f"🆔 Task ID: {t['id']}\n"
+            f"👤 User ID: {t['user_id']}\n"
+            f"🖥 Server: local\n"
+            f"⚙️ Crawler: wtr_local\n"
+            f"🌐 URL: {t['url']}\n"
+            f"📖 Range: {t['chapter_range']}\n"
+            f"📌 Status: {t['status']}\n"
+            f"🕒 Created: {t['created_at']}\n"
+            f"-----------------------------\n"
         )
-    bot.reply_to(message, "\n".join(lines)[:4000])
+    _send_long_text(message.chat.id, text)
 
 
 @bot.message_handler(commands=["cancel"])
