@@ -34,4 +34,4 @@ downloaded_files/
 *.tmp
 *.epub.tmp
 dist/
-build/
+build/"downloaded_files/" 
