@@ -1,0 +1,6 @@
+pyTelegramBotAPI>=4.14.0
+python-dotenv>=1.0.0
+beautifulsoup4>=4.12.0
+ebooklib>=0.18
+cryptography>=41.0.0
+seleniumbase>=4.25.0
