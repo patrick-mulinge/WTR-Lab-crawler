@@ -1894,13 +1894,22 @@ class WtrLabClient:
 # EPUB construction from permanent XHTML cache
 # ---------------------------------------------------------------------------
 
+# Chapters per volume in the EPUB TOC (expand/collapse in readers).
+EPUB_CHAPTERS_PER_VOLUME = 100
+
+# Footer branding on the EPUB intro page (same bot/group as the other crawler).
+EPUB_BOT_URL = "https://t.me/lightnovel_crawer_bot"
+EPUB_BOT_LABEL = "BOT: Novel Downloader"
+EPUB_GROUP_URL = "https://t.me/novelsFinder"
+EPUB_GROUP_LABEL = "Webnovels and Wuxia Novels"
+
+
 def build_epub(
     novel: NovelInfo,
     novel_dir: Path,
     start: int,
     end: int,
 ) -> Path:
-    chapters_dir = novel_dir / "chapters"
     artifacts_dir = novel_dir / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1947,8 +1956,10 @@ def build_epub(
         content=b"""
             body { line-height: 1.55; margin: 5%; }
             h1 { text-align: center; margin: 1.5em 0; }
+            h2 { text-align: center; margin: 1.2em 0; opacity: 0.9; }
             p { margin: 0.8em 0; }
             img { max-width: 100%; height: auto; }
+            .footer { margin-top: 2em; font-size: 0.95em; opacity: 0.9; }
         """,
     )
     book.add_item(style)
@@ -1961,11 +1972,24 @@ def build_epub(
             f"<h1>{html.escape(novel.title)}</h1>"
             f"<p><b>Author:</b> {html.escape(novel.author or 'Unknown')}</p>"
             f"<p><b>Status:</b> {html.escape(novel.status_label)}</p>"
-            f"<p><b>AI-Unlock:</b> {novel.unlock_count}/{novel.chapter_count or len(novel.chapters)}</p>"
+            f"<p><b>AI-Unlock:</b> {novel.unlock_count}/"
+            f"{novel.chapter_count or len(novel.chapters)}</p>"
             f"<p><b>Source:</b> "
             f'<a href="{html.escape(novel.source_url, quote=True)}">'
             f"{html.escape(novel.source_url)}</a></p>"
-            f"<h2>Synopsis</h2><p>{html.escape(novel.synopsis or 'No synopsis available.')}</p>"
+            f"<h2>Synopsis</h2>"
+            f"<p>{html.escape(novel.synopsis or 'No synopsis available.')}</p>"
+            f'<div class="footer">'
+            f"<p><b>Source:</b> "
+            f'<a href="{html.escape(novel.source_url, quote=True)}">'
+            f"{html.escape(novel.source_url)}</a></p>"
+            f"<p>Made by Telegram bot:<br/>"
+            f'<a href="{html.escape(EPUB_BOT_URL, quote=True)}">'
+            f"{html.escape(EPUB_BOT_LABEL)}</a></p>"
+            f"<p>Telegram group:<br/>"
+            f'<a href="{html.escape(EPUB_GROUP_URL, quote=True)}">'
+            f"{html.escape(EPUB_GROUP_LABEL)}</a></p>"
+            f"</div>"
         ),
     )
     intro.add_link(href="style/style.css", rel="stylesheet", type="text/css")
@@ -1993,8 +2017,56 @@ def build_epub(
     if cover_path:
         book.set_cover("cover" + cover_path.suffix, cover_path.read_bytes())
 
-    chapter_items = []
+    # Group chapters into volumes of EPUB_CHAPTERS_PER_VOLUME for a nested TOC
+    # (readers can expand/collapse each volume like a folded code block).
+    volume_sections: list[tuple[Any, list]] = []
+    spine_items: list = []
+    per_vol = max(1, EPUB_CHAPTERS_PER_VOLUME)
+
+    current_vol_no: int | None = None
+    current_vol_page = None
+    current_chapter_items: list = []
+
+    def flush_volume():
+        nonlocal current_vol_page, current_chapter_items
+        if current_vol_page is None or not current_chapter_items:
+            current_vol_page = None
+            current_chapter_items = []
+            return
+        volume_sections.append(
+            (current_vol_page, list(current_chapter_items))
+        )
+        current_vol_page = None
+        current_chapter_items = []
+
     for chapter_no, chapter_title, xhtml_path in selected:
+        # Volume index from absolute chapter number so ranges stay stable
+        # across partial downloads (e.g. ch 101 always lands in Volume 2).
+        vol_no = ((max(1, chapter_no) - 1) // per_vol) + 1
+        vol_start = (vol_no - 1) * per_vol + 1
+        vol_end = vol_no * per_vol
+
+        if vol_no != current_vol_no:
+            flush_volume()
+            current_vol_no = vol_no
+            vol_title = f"Volume {vol_no} (Ch. {vol_start}–{vol_end})"
+            current_vol_page = epub.EpubHtml(
+                uid=f"volume-{vol_no}",
+                file_name=f"volumes/volume_{vol_no:03}.xhtml",
+                title=vol_title,
+                content=(
+                    f"<h1>{html.escape(vol_title)}</h1>"
+                    f"<p>{html.escape(novel.title)}</p>"
+                ),
+            )
+            current_vol_page.add_link(
+                href="../style/style.css",
+                rel="stylesheet",
+                type="text/css",
+            )
+            book.add_item(current_vol_page)
+            spine_items.append(current_vol_page)
+
         item = epub.EpubHtml(
             uid=f"chapter-{chapter_no}",
             file_name=f"chapters/{chapter_no:05}.xhtml",
@@ -2003,14 +2075,20 @@ def build_epub(
         )
         item.add_link(href="../style/style.css", rel="stylesheet", type="text/css")
         book.add_item(item)
-        chapter_items.append(item)
+        current_chapter_items.append(item)
+        spine_items.append(item)
 
-    # This creates a real EPUB table of contents followed by chapters in order.
-    book.toc = [
-        intro,
-        (epub.Section("Chapters"), tuple(chapter_items)),
-    ]
-    book.spine = ["cover", intro, "nav", *chapter_items]
+    flush_volume()
+
+    # Nested TOC: Info, then each Volume with its chapters underneath.
+    toc_entries: list = [intro]
+    for vol_page, ch_items in volume_sections:
+        toc_entries.append(
+            (epub.Section(vol_page.title), (vol_page, *ch_items))
+        )
+
+    book.toc = toc_entries
+    book.spine = ["cover", intro, "nav", *spine_items]
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
 
