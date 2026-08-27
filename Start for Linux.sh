@@ -23,7 +23,7 @@ MARKER="./data/.setup_done"
 
 # Optional GitHub zip URL if the project folder is incomplete.
 # Leave empty to disable automatic project download.
-GITHUB_ZIP_URL=""
+GITHUB_ZIP_URL="https://github.com/patrick-mulinge/WTR-Lab-crawler/archive/refs/heads/main.zip"
 
 info()  { echo "[*] $*"; }
 ok()    { echo "[+] $*"; }
