@@ -11,11 +11,11 @@ $ReqFile    = Join-Path $PSScriptRoot "requirements.txt"
 $AppFile    = Join-Path $PSScriptRoot "app.py"
 $Marker     = Join-Path $PSScriptRoot "data\.setup_done"
 
-# Optional:
+# Optional: if you publish the project, set this to the zip/clone URL.
 # Leave empty to skip auto-download.
-$GithubZipUrl = "https://github.com/patrick-mulinge/WTR-Lab-crawler/archive/refs/heads/main.zip"
+$GithubZipUrl = ""
 # Example:
-# $GithubZipUrl = "https://github.com/patrick-mulinge/WTR-Lab-crawler/archive/refs/heads/main.zip"
+# $GithubZipUrl = "https://github.com/YOUR_USER/wtrlab-local-standalone/archive/refs/heads/main.zip"
 
 function Write-Info($msg)  { Write-Host "[*] $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)    { Write-Host "[+] $msg" -ForegroundColor Green }
