@@ -13,7 +13,7 @@ $Marker     = Join-Path $PSScriptRoot "data\.setup_done"
 
 # Optional: if you publish the project, set this to the zip/clone URL.
 # Leave empty to skip auto-download.
-$GithubZipUrl = ""
+$GithubZipUrl = "https://github.com/patrick-mulinge/WTR-Lab-crawler/archive/refs/heads/main.zip"
 # Example:
 # $GithubZipUrl = "https://github.com/YOUR_USER/wtrlab-local-standalone/archive/refs/heads/main.zip"
 
