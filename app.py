@@ -264,6 +264,8 @@ def setup_local_db():
                 chat_id INTEGER NOT NULL,
                 user_id INTEGER NOT NULL,
                 username TEXT,
+                first_name TEXT,
+                last_name TEXT,
                 url TEXT NOT NULL,
                 chapter_range TEXT NOT NULL DEFAULT 'all',
                 status TEXT NOT NULL DEFAULT 'pending',
@@ -316,6 +318,12 @@ def setup_local_db():
             "INSERT OR IGNORE INTO settings(key, value) VALUES ('chapter_cap', ?)",
             (str(DEFAULT_CHAPTER_CAP),),
         )
+        # Existing installs may predate these columns.
+        for col in ("first_name", "last_name"):
+            try:
+                conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already exists
         conn.commit()
     finally:
         conn.close()
@@ -434,6 +442,8 @@ def insert_task(
     url: str,
     chapter_range: str,
     username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
     unlimited_cap: bool = False,
 ) -> tuple[Optional[int], Optional[str]]:
     """Returns (task_id, error_message). error_message is None on success."""
@@ -463,10 +473,21 @@ def insert_task(
     try:
         cur = conn.execute(
             """
-            INSERT INTO tasks (chat_id, user_id, username, url, chapter_range, status)
-            VALUES (?, ?, ?, ?, ?, 'pending')
+            INSERT INTO tasks (
+                chat_id, user_id, username, first_name, last_name,
+                url, chapter_range, status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
             """,
-            (chat_id, user_id, username, url, chapter_range),
+            (
+                chat_id,
+                user_id,
+                username,
+                first_name,
+                last_name,
+                url,
+                chapter_range,
+            ),
         )
         conn.commit()
         return int(cur.lastrowid), None
@@ -678,8 +699,15 @@ def cache_has_chapter(novel_id: str, chapter_no: int) -> bool:
         if not (row and Path(row["xhtml_path"]).is_file()):
             return False
 
+        path = Path(row["xhtml_path"])
         try:
-            text = Path(row["xhtml_path"]).read_text(encoding="utf-8")
+            if chapter_cache_is_bad(path):
+                print(
+                    f"[CACHE] Re-download chapter {chapter_no}: "
+                    "empty or unusable file"
+                )
+                return False
+            text = path.read_text(encoding="utf-8", errors="replace")
         except Exception:
             return False
 
@@ -1865,6 +1893,7 @@ class WtrLabClient:
                 f"{len(prepared_terms)} glossary slot(s)"
             )
 
+        # Body fragment only — ebooklib EpubHtml wraps content itself.
         return "\n".join(fragments)
 
     def cache_image(self, image_url: str, novel_dir: Path) -> Optional[str]:
@@ -1904,6 +1933,233 @@ EPUB_GROUP_URL = "https://t.me/novelsFinder"
 EPUB_GROUP_LABEL = "Webnovels and Wuxia Novels"
 
 
+def _chapter_placeholder_fragment(chapter_no: int, title: str, reason: str) -> str:
+    """Body fragment only — ebooklib wraps EpubHtml itself; full documents break it."""
+    safe_title = html.escape(str(title or f"Chapter {chapter_no}")[:200])
+    safe_reason = html.escape(reason[:200])
+    return (
+        f"<h1>{safe_title}</h1>\n"
+        f"<p><em>Chapter content unavailable ({safe_reason}).</em></p>"
+    )
+
+
+def _decode_chapter_bytes(raw: bytes) -> str:
+    raw = (raw or b"").replace(b"\x00", b"")
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        try:
+            return raw.decode("utf-16")
+        except Exception:
+            return raw.decode("utf-8", errors="replace")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    return raw.decode("utf-8", errors="replace")
+
+
+def _chapter_text_is_empty(text: str) -> bool:
+    """True if file has no usable body (whitespace / tags-only count as empty)."""
+    if not text or not text.strip():
+        return True
+    # Strip tags; if almost nothing remains, treat as empty.
+    plain = re.sub(r"<[^>]+>", " ", text)
+    plain = re.sub(r"\s+", " ", plain).strip()
+    return len(plain) < 3
+
+
+def chapter_cache_is_bad(path: Path) -> bool:
+    """Disk chapter unusable for EPUB (missing, empty, or whitespace/NUL-only)."""
+    try:
+        if not path.is_file():
+            return True
+        raw = path.read_bytes()
+        if not raw:
+            return True
+        return _chapter_text_is_empty(_decode_chapter_bytes(raw))
+    except Exception:
+        return True
+
+
+def purge_chapter_cache(novel_id: str, chapter_no: int, path: Optional[Path] = None):
+    """Delete a bad chapter file and its SQLite row so it can be re-downloaded."""
+    if path is None:
+        path = LIBRARY_DIR / str(novel_id) / "chapters" / f"{chapter_no:05}.xhtml"
+    try:
+        if path.is_file():
+            path.unlink()
+            print(f"[CACHE] Deleted bad chapter file {path.name}")
+    except OSError as error:
+        print(f"[CACHE] Could not delete {path}: {error}")
+    conn = local_db()
+    try:
+        conn.execute(
+            "DELETE FROM chapters WHERE novel_id=? AND chapter_no=?",
+            (str(novel_id), int(chapter_no)),
+        )
+        conn.commit()
+    except Exception as error:
+        print(f"[CACHE] DB purge error ch {chapter_no}: {error}")
+    finally:
+        conn.close()
+
+
+def find_bad_cached_chapters(novel_id: str, start: int, end: int) -> list[int]:
+    """Return chapter numbers in [start, end] that are missing or empty on disk."""
+    bad: list[int] = []
+    conn = local_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT chapter_no, xhtml_path FROM chapters
+            WHERE novel_id=? AND chapter_no BETWEEN ? AND ?
+            ORDER BY chapter_no ASC
+            """,
+            (str(novel_id), start, end),
+        ).fetchall()
+        present = {}
+        for row in rows:
+            present[int(row["chapter_no"])] = Path(row["xhtml_path"])
+    finally:
+        conn.close()
+
+    for n in range(start, end + 1):
+        path = present.get(n) or (
+            LIBRARY_DIR / str(novel_id) / "chapters" / f"{n:05}.xhtml"
+        )
+        if chapter_cache_is_bad(path):
+            bad.append(n)
+    return bad
+
+
+def repair_bad_chapters(
+    client: "WtrLabClient",
+    novel: "NovelInfo",
+    novel_dir: Path,
+    start: int,
+    end: int,
+    progress_message=None,
+) -> list[int]:
+    """
+    Find empty/bad cached chapters in range, delete them, re-download immediately.
+    Returns list of chapter numbers still bad after the attempt.
+    """
+    bad_nos = find_bad_cached_chapters(novel.novel_id, start, end)
+    if not bad_nos:
+        return []
+
+    print(
+        f"[REPAIR] {len(bad_nos)} bad/empty chapter(s) in {start}-{end}: "
+        f"{bad_nos[:20]}{'…' if len(bad_nos) > 20 else ''}"
+    )
+    edit_progress(
+        progress_message,
+        (
+            f"📖 {novel.title}\n\n"
+            f"🔧 Found {len(bad_nos)} empty/corrupt chapter(s).\n"
+            "Deleting and re-downloading before building EPUB..."
+        ),
+    )
+
+    by_order = {ch.order: ch for ch in novel.chapters}
+    still_bad: list[int] = []
+
+    for i, chapter_no in enumerate(bad_nos, start=1):
+        path = novel_dir / "chapters" / f"{chapter_no:05}.xhtml"
+        purge_chapter_cache(novel.novel_id, chapter_no, path)
+
+        chapter = by_order.get(chapter_no)
+        if not chapter:
+            print(f"[REPAIR] Chapter {chapter_no} not in novel TOC — skip")
+            still_bad.append(chapter_no)
+            continue
+
+        try:
+            title, xhtml = client.download_chapter(novel, chapter, novel_dir)
+            if not xhtml or _chapter_text_is_empty(xhtml):
+                raise WtrError(
+                    f"Re-download of chapter {chapter_no} returned empty body"
+                )
+            atomic_write_text(path, xhtml)
+            cache_chapter(
+                novel.novel_id,
+                chapter.order,
+                chapter.chapter_id,
+                title,
+                path,
+            )
+            if chapter_cache_is_bad(path):
+                print(f"[REPAIR] Chapter {chapter_no} still bad after download")
+                still_bad.append(chapter_no)
+            else:
+                print(
+                    f"[REPAIR] Re-downloaded chapter {chapter_no} "
+                    f"({i}/{len(bad_nos)})"
+                )
+        except ChapterLocked:
+            print(f"[REPAIR] Chapter {chapter_no} is AI-locked — cannot fill")
+            still_bad.append(chapter_no)
+        except Exception as error:
+            print(
+                f"[REPAIR] Chapter {chapter_no} failed: "
+                f"{type(error).__name__}: {error}"
+            )
+            still_bad.append(chapter_no)
+
+        # Light pacing between repair downloads
+        wait = next_chapter_throttle()
+        if wait > 0 and i < len(bad_nos):
+            time.sleep(min(wait, 5.0))
+
+    if still_bad:
+        print(f"[REPAIR] Still bad after re-download: {still_bad}")
+    else:
+        print("[REPAIR] All bad chapters repaired")
+    return still_bad
+
+
+def _load_chapter_xhtml(path: Path, chapter_no: int, title: str) -> str:
+    """
+    Load chapter body HTML for ebooklib EpubHtml.
+
+    Returns a non-empty HTML *fragment* (not a full document). ebooklib wraps
+    fragments; feeding full <html> documents can yield ParserError: Document is empty.
+    """
+    try:
+        raw = path.read_bytes()
+    except Exception as error:
+        print(f"[EPUB] Could not read chapter {chapter_no}: {error}")
+        return _chapter_placeholder_fragment(chapter_no, title, "read error")
+
+    text = _decode_chapter_bytes(raw).strip()
+    if _chapter_text_is_empty(text):
+        print(f"[EPUB] Chapter {chapter_no} empty after cleanup — placeholder")
+        return _chapter_placeholder_fragment(chapter_no, title, "empty file")
+
+    # If a full document was stored, use body inner HTML only.
+    lower = text[:400].lower()
+    if "<html" in lower or "<?xml" in lower or "<body" in lower:
+        try:
+            from lxml import html as lxml_html
+
+            doc = lxml_html.fromstring(text.encode("utf-8"))
+            body = doc.find(".//body")
+            if body is not None:
+                inner = "".join(
+                    [
+                        lxml_html.tostring(c, encoding="unicode")
+                        if not isinstance(c, str)
+                        else c
+                        for c in body
+                    ]
+                )
+                if body.text:
+                    inner = body.text + inner
+                if inner and not _chapter_text_is_empty(inner):
+                    return inner
+        except Exception:
+            pass
+
+    return text
+
+
 def build_epub(
     novel: NovelInfo,
     novel_dir: Path,
@@ -1929,7 +2185,14 @@ def build_epub(
 
         for row in rows:
             path = Path(row["xhtml_path"])
-            if path.is_file():
+            if path.is_file() and path.stat().st_size > 0:
+                selected.append((row["chapter_no"], row["title"], path))
+            elif path.is_file():
+                # Zero-byte file: still include via placeholder so TOC stays continuous.
+                print(
+                    f"[EPUB] Zero-byte chapter file: {path.name} "
+                    f"(ch {row['chapter_no']})"
+                )
                 selected.append((row["chapter_no"], row["title"], path))
     finally:
         conn.close()
@@ -1995,11 +2258,11 @@ def build_epub(
     intro.add_link(href="style/style.css", rel="stylesheet", type="text/css")
     book.add_item(intro)
 
-    # Add cached inline images to EPUB.
+    # Add cached inline images to EPUB (skip empty files).
     images_dir = novel_dir / "images"
     if images_dir.exists():
         for image_path in images_dir.iterdir():
-            if not image_path.is_file():
+            if not image_path.is_file() or image_path.stat().st_size <= 0:
                 continue
 
             mime, _ = mimetypes.guess_type(image_path.name)
@@ -2014,7 +2277,7 @@ def build_epub(
 
     # Cover is optional and cached locally.
     cover_path = find_cached_cover(novel_dir)
-    if cover_path:
+    if cover_path and cover_path.is_file() and cover_path.stat().st_size > 0:
         book.set_cover("cover" + cover_path.suffix, cover_path.read_bytes())
 
     # Group chapters into volumes of EPUB_CHAPTERS_PER_VOLUME for a nested TOC
@@ -2071,7 +2334,9 @@ def build_epub(
             uid=f"chapter-{chapter_no}",
             file_name=f"chapters/{chapter_no:05}.xhtml",
             title=f"{chapter_no}: {chapter_title}",
-            content=xhtml_path.read_text(encoding="utf-8"),
+            content=_load_chapter_xhtml(
+                xhtml_path, chapter_no, chapter_title or f"Chapter {chapter_no}"
+            ),
         )
         item.add_link(href="../style/style.css", rel="stylesheet", type="text/css")
         book.add_item(item)
@@ -2092,15 +2357,39 @@ def build_epub(
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
 
-    epub.write_epub(str(temporary_path), book, {})
+    try:
+        epub.write_epub(str(temporary_path), book, {})
+    except Exception as error:
+        # Surface a clearer clue than bare "Document is empty".
+        print(
+            f"[EPUB WRITE ERROR] {type(error).__name__}: {error} "
+            f"(novel={novel.novel_id} chapters={len(selected)} "
+            f"range={start}-{end})"
+        )
+        if temporary_path.exists():
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
+        raise
+
     shutil.move(str(temporary_path), str(output_path))
 
     return output_path
 
 
 # ---------------------------------------------------------------------------
-# Telegram delivery
+# Telegram delivery + auto-delete (mirrors main.py intent)
 # ---------------------------------------------------------------------------
+
+# Short notices + task notices → 24h (per operator request).
+DELETE_AFTER_NOTICE = 24 * 60 * 60
+# Long listings (/queue, /logs, /mytasks, /start help, etc.) → 1 hour.
+DELETE_AFTER_LIST = 60 * 60
+
+# user_id -> list[(chat_id, message_id)]
+_bot_messages: dict[int, list[tuple[int, int]]] = {}
+
 
 def telegram_call(function, *args, **kwargs):
     try:
@@ -2108,6 +2397,101 @@ def telegram_call(function, *args, **kwargs):
     except Exception as error:
         print(f"[TELEGRAM ERROR] {type(error).__name__}: {error}")
         return None
+
+
+def delete_message_later(chat_id, message_id, delay: int):
+    def _run():
+        time.sleep(max(0, int(delay)))
+        try:
+            bot.delete_message(chat_id, message_id)
+        except Exception:
+            pass
+        for uid, entries in list(_bot_messages.items()):
+            _bot_messages[uid] = [
+                (c, m) for c, m in entries if not (c == chat_id and m == message_id)
+            ]
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def track_and_autodelete(msg, user_id: int | None, delay: int):
+    """Remember a bot message and delete it after *delay* seconds."""
+    if not msg:
+        return msg
+    try:
+        chat_id = msg.chat.id
+        mid = msg.message_id
+    except Exception:
+        return msg
+    if user_id is not None:
+        _bot_messages.setdefault(int(user_id), []).append((chat_id, mid))
+    delete_message_later(chat_id, mid, delay)
+    return msg
+
+
+def cleanup_bot_message(chat_id, message_id):
+    """Delete immediately (e.g. progress message when the job ends)."""
+    if not message_id:
+        return
+    try:
+        bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
+
+def send_notice(
+    chat_id,
+    text: str,
+    *,
+    user_id: int | None = None,
+    parse_mode: str | None = None,
+    delay: int = DELETE_AFTER_NOTICE,
+):
+    """Short / task notice — auto-deletes (default 24h)."""
+    msg = telegram_call(
+        bot.send_message,
+        chat_id,
+        text,
+        parse_mode=parse_mode,
+        disable_web_page_preview=True,
+    )
+    return track_and_autodelete(msg, user_id, delay)
+
+
+def reply_notice(
+    message,
+    text: str,
+    *,
+    parse_mode: str | None = None,
+    delay: int = DELETE_AFTER_NOTICE,
+):
+    """reply_to variant for short/task notices (24h)."""
+    try:
+        msg = bot.reply_to(message, text, parse_mode=parse_mode)
+    except Exception as error:
+        print(f"[TELEGRAM ERROR] {type(error).__name__}: {error}")
+        return None
+    uid = message.from_user.id if message.from_user else None
+    return track_and_autodelete(msg, uid, delay)
+
+
+def send_list_temp(
+    chat_id,
+    text: str,
+    *,
+    user_id: int | None = None,
+    parse_mode: str | None = None,
+    delay: int = DELETE_AFTER_LIST,
+):
+    """Long listing — auto-deletes after 1 hour."""
+    msg = telegram_call(
+        bot.send_message,
+        chat_id,
+        text,
+        parse_mode=parse_mode,
+        disable_web_page_preview=True,
+    )
+    return track_and_autodelete(msg, user_id, delay)
 
 
 def edit_progress(message, text: str):
@@ -2259,12 +2643,11 @@ def send_completed_files(
 
     if not document_message:
         mark_upload_failed(task["id"])
-        telegram_call(
-            bot.send_message,
+        send_notice(
             chat_id,
             "⚠️ The EPUB was created and remains safely stored on the local WTR worker, "
             "but Telegram could not accept the upload right now.",
-            disable_web_page_preview=True,
+            user_id=task.get("user_id"),
         )
         return False
 
@@ -2486,11 +2869,11 @@ def process_task(task: dict, browser: WtrBrowser):
     end = 1
     completed = 0
 
-    progress = telegram_call(
-        bot.send_message,
+    progress = send_notice(
         chat_id,
         "📥 WTR-Lab download started.\n\n📊 Progress: preparing...",
-        disable_web_page_preview=True,
+        user_id=task.get("user_id"),
+        delay=DELETE_AFTER_NOTICE,
     )
 
     def on_status(kind: str, detail: str = ""):
@@ -2527,20 +2910,22 @@ def process_task(task: dict, browser: WtrBrowser):
                 progress,
                 f"📖 {novel.title}\n\n📚 Packing EPUB of unlocked chapters {start}-{last}...",
             )
+            try:
+                repair_bad_chapters(
+                    client, novel, novel_dir, start, last, progress
+                )
+            except Exception as repair_error:
+                print(f"[REPAIR PARTIAL ERROR] {repair_error}")
             epub_path = build_epub(novel, novel_dir, start, last)
             display_title = f"{novel.title} c{start}-{last}"
             save_task_cache(task_id, novel.novel_id, epub_path, display_title)
-            telegram_call(
-                bot.send_message,
+            send_notice(
                 chat_id,
                 reason,
-                disable_web_page_preview=True,
+                user_id=task.get("user_id"),
             )
             if progress:
-                try:
-                    bot.delete_message(chat_id, progress.message_id)
-                except Exception:
-                    pass
+                cleanup_bot_message(chat_id, progress.message_id)
             return send_completed_files(task, novel, novel_dir, epub_path, display_title)
         except Exception as pack_error:
             print(f"[PARTIAL EPUB ERROR] {pack_error}")
@@ -2583,15 +2968,16 @@ def process_task(task: dict, browser: WtrBrowser):
                 f"AI-Unlock progress is {unlocked_cap}/{total_listed}."
             )
 
-        # Jump straight to first missing chapter (no slow scan feel).
-        resume_index = 0
-        while (
-            resume_index < len(requested)
-            and cache_has_chapter(novel.novel_id, requested[resume_index].order)
-        ):
-            resume_index += 1
-
-        completed = resume_index
+        # Only fetch chapters that are missing/empty. Gaps (e.g. ch 200 + 387
+        # bad while 201–386 are fine) must NOT re-download everything after the
+        # first hole — that was overwriting good cache.
+        to_fetch = [
+            ch
+            for ch in requested
+            if not cache_has_chapter(novel.novel_id, ch.order)
+        ]
+        cached_count = len(requested) - len(to_fetch)
+        completed = cached_count
         last_progress = 0.0
         last_chapter_request = 0.0
 
@@ -2599,44 +2985,49 @@ def process_task(task: dict, browser: WtrBrowser):
             f"🔓 AI-Unlock: {unlocked_cap}/{total_listed} · {novel.status_label}"
         )
 
-        if resume_index:
-            next_ch = (
-                requested[resume_index].order
-                if resume_index < len(requested)
-                else None
-            )
+        if to_fetch:
+            sample = [ch.order for ch in to_fetch[:12]]
+            more = "…" if len(to_fetch) > 12 else ""
             print(
                 f"[RESUME] novel={novel.novel_id} "
-                f"cached={resume_index}/{len(requested)} next={next_ch}"
+                f"cached={cached_count}/{len(requested)} "
+                f"missing={len(to_fetch)} {sample}{more}"
             )
             edit_progress(
                 progress,
                 (
                     f"📖 {novel.title}\n\n"
                     f"📥 Resuming local WTR-Lab worker...\n\n"
-                    f"📌 Cached already: {resume_index}/{len(requested)}\n"
-                    f"▶️ Next download: "
-                    f"{'chapter ' + str(next_ch) if next_ch else 'none (all cached)'}\n"
+                    f"📌 Cached already: {cached_count}/{len(requested)}\n"
+                    f"▶️ To download: {len(to_fetch)} chapter(s) "
+                    f"(only gaps / empty files)\n"
                     f"🔍 Range: from {start} to {end}\n"
                     f"{unlock_line}"
                 ),
             )
         else:
+            print(
+                f"[RESUME] novel={novel.novel_id} "
+                f"cached={cached_count}/{len(requested)} next=None"
+            )
             edit_progress(
                 progress,
                 (
                     f"📖 {novel.title}\n\n"
-                    f"📥 Downloading with local WTR-Lab worker...\n\n"
+                    f"📥 All chapters cached — preparing EPUB...\n\n"
                     f"🔍 Range: from {start} to {end}\n"
                     f"{unlock_line}"
                 ),
             )
 
-        for chapter in requested[resume_index:]:
+        for chapter in to_fetch:
             if is_cancelled(task_id):
                 raise TaskCancelled()
 
             xhtml_path = novel_dir / "chapters" / f"{chapter.order:05}.xhtml"
+            # Drop any empty/corrupt file before rewrite.
+            if xhtml_path.is_file() and chapter_cache_is_bad(xhtml_path):
+                purge_chapter_cache(novel.novel_id, chapter.order, xhtml_path)
 
             elapsed = time.monotonic() - last_chapter_request
             target_wait = next_chapter_throttle()
@@ -2703,24 +3094,30 @@ def process_task(task: dict, browser: WtrBrowser):
                         f"📖 Currently At: Chapter {chapter.order}\n"
                         f"🔍 Range: from {start} to {end}\n"
                         f"{unlock_line}\n\n"
-                        f"📌 Status: {completed}/{len(requested)} chapters available"
+                        f"📌 Status: {completed}/{len(requested)} chapters available "
+                        f"({len(to_fetch)} gap(s) this run)"
                     ),
                 )
 
         edit_progress(
             progress,
-            f"📖 {novel.title}\n\n📚 Creating EPUB from cached XHTML...",
+            f"📖 {novel.title}\n\n📚 Checking cache / creating EPUB...",
         )
 
+        # Empty-but-non-zero files (spaces/NULs) still look "present" in the
+        # resume counter — purge + re-download them before packing.
+        repair_bad_chapters(client, novel, novel_dir, start, end, progress)
+
+        edit_progress(
+            progress,
+            f"📖 {novel.title}\n\n📚 Creating EPUB from cached XHTML...",
+        )
         epub_path = build_epub(novel, novel_dir, start, end)
         display_title = f"{novel.title} c{start}-{end}"
         save_task_cache(task_id, novel.novel_id, epub_path, display_title)
 
         if progress:
-            try:
-                bot.delete_message(chat_id, progress.message_id)
-            except Exception:
-                pass
+            cleanup_bot_message(chat_id, progress.message_id)
 
         if send_completed_files(
             task,
@@ -2734,10 +3131,7 @@ def process_task(task: dict, browser: WtrBrowser):
     except TaskCancelled:
         print(f"[CANCELLED] Task {task_id}")
         if progress:
-            try:
-                bot.delete_message(chat_id, progress.message_id)
-            except Exception:
-                pass
+            cleanup_bot_message(chat_id, progress.message_id)
 
     except DeadBrowser:
         print(f"[DEAD BROWSER] Task {task_id}")
@@ -2768,8 +3162,7 @@ def process_task(task: dict, browser: WtrBrowser):
             edit_progress(progress, f"⚠️ WTR-Lab download failed.\n\n{reason}")
 
         if not partial_sent:
-            telegram_call(
-                bot.send_message,
+            send_notice(
                 chat_id,
                 (
                     f"⚠️ WTR-Lab could not complete this task.\n\n"
@@ -2777,7 +3170,7 @@ def process_task(task: dict, browser: WtrBrowser):
                     "Cached chapters stay on disk.\n"
                     "📌 Resend the same novel link (or /continue) to resume."
                 ),
-                disable_web_page_preview=True,
+                user_id=task.get("user_id"),
             )
         mark_failed(task_id, reason)
     finally:
@@ -2793,7 +3186,7 @@ def deny_if_needed(message) -> bool:
     uid = message.from_user.id
     if user_allowed(uid):
         return False
-    bot.reply_to(
+    reply_notice(
         message,
         "❌ This personal WTR-Lab bot is locked to its owner. "
         "Set ALLOWED_USER_IDS in .env.",
@@ -2823,28 +3216,32 @@ def cmd_start(message):
             "/logs — task logs with user details\n"
             "/trial — all tasks in table\n"
         )
-    bot.reply_to(
-        message,
-        "📚 <b>Personal WTR-Lab downloader</b>\n\n"
-        "Runs entirely on this PC. Tasks are stored in a local SQLite database "
-        "(not a shared cloud queue).\n\n"
-        "<b>Commands</b>\n"
-        "/download — queue a wtr-lab.com novel\n"
-        "/queue — your pending/running tasks\n"
-        "/mytasks — your recent tasks (any status)\n"
-        "/continue — re-queue your latest failed task\n"
-        "/cancel — cancel your pending/running tasks\n"
-        "/status — worker status\n"
-        "/cap — show chapter cap\n"
-        f"{admin_line}\n"
-        f"{limit_line}"
-        f"{cap_line}"
-        "Failed/partial downloads: resend the <b>same</b> link or /continue "
-        "to resume from cache. A different novel is blocked while that slot "
-        "is used.\n\n"
-        "Only links from <code>wtr-lab.com</code> are accepted.",
-        parse_mode="HTML",
-    )
+    try:
+        msg = bot.reply_to(
+            message,
+            "📚 <b>Personal WTR-Lab downloader</b>\n\n"
+            "Runs entirely on this PC. Tasks are stored in a local SQLite database "
+            "(not a shared cloud queue).\n\n"
+            "<b>Commands</b>\n"
+            "/download — queue a wtr-lab.com novel\n"
+            "/queue — your pending/running tasks\n"
+            "/mytasks — your recent tasks (any status)\n"
+            "/continue — re-queue your latest failed task\n"
+            "/cancel — cancel your pending/running tasks\n"
+            "/status — worker status\n"
+            "/cap — show chapter cap\n"
+            f"{admin_line}\n"
+            f"{limit_line}"
+            f"{cap_line}"
+            "Failed/partial downloads: resend the <b>same</b> link or /continue "
+            "to resume from cache. A different novel is blocked while that slot "
+            "is used.\n\n"
+            "Only links from <code>wtr-lab.com</code> are accepted.",
+            parse_mode="HTML",
+        )
+        track_and_autodelete(msg, message.from_user.id, DELETE_AFTER_LIST)
+    except Exception as error:
+        print(f"[TELEGRAM ERROR] {error}")
 
 
 @bot.message_handler(commands=["status"])
@@ -2852,22 +3249,26 @@ def cmd_status(message):
     if deny_if_needed(message):
         return
     cap = get_chapter_cap()
-    bot.reply_to(
-        message,
-        (
-            "🖥 <b>WTR local worker</b>\n"
-            f"SQLite: <code>{html.escape(str(SQLITE_PATH))}</code>\n"
-            f"Chapter cap: {'unlimited' if cap <= 0 else cap}\n"
-            f"Daily task limit: "
-            f"{'none' if DAILY_TASK_LIMIT <= 0 else DAILY_TASK_LIMIT}\n"
-            f"Throttle: {CHAPTER_THROTTLE_MIN:.0f}–{CHAPTER_THROTTLE_MAX:.0f}s"
-        ),
-        parse_mode="HTML",
-    )
+    try:
+        msg = bot.reply_to(
+            message,
+            (
+                "🖥 <b>WTR local worker</b>\n"
+                f"SQLite: <code>{html.escape(str(SQLITE_PATH))}</code>\n"
+                f"Chapter cap: {'unlimited' if cap <= 0 else cap}\n"
+                f"Daily task limit: "
+                f"{'none' if DAILY_TASK_LIMIT <= 0 else DAILY_TASK_LIMIT}\n"
+                f"Throttle: {CHAPTER_THROTTLE_MIN:.0f}–{CHAPTER_THROTTLE_MAX:.0f}s"
+            ),
+            parse_mode="HTML",
+        )
+        track_and_autodelete(msg, message.from_user.id, DELETE_AFTER_LIST)
+    except Exception as error:
+        print(f"[TELEGRAM ERROR] {error}")
 
 
-def _send_long_text(chat_id, text: str):
-    """Split long listings to stay under Telegram's message limit."""
+def _send_long_text(chat_id, text: str, user_id: int | None = None):
+    """Split long listings; each chunk auto-deletes after 1 hour."""
     text = text or ""
     if not text:
         return
@@ -2875,11 +3276,7 @@ def _send_long_text(chat_id, text: str):
     while text:
         chunk = text[:max_len]
         text = text[max_len:]
-        try:
-            bot.send_message(chat_id, chunk, disable_web_page_preview=True)
-        except Exception as error:
-            print(f"[SEND LONG TEXT ERROR] {error}")
-            break
+        send_list_temp(chat_id, chunk, user_id=user_id)
 
 
 @bot.message_handler(commands=["mytasks", "tasks"])
@@ -2903,7 +3300,7 @@ def cmd_mytasks(message):
         conn.close()
 
     if not rows:
-        bot.reply_to(message, "ℹ️ Queue is empty.")
+        reply_notice(message, "ℹ️ Queue is empty.")
         return
 
     text = "📋 All trial in Table:\n\n"
@@ -2920,7 +3317,7 @@ def cmd_mytasks(message):
             f"✅ Completed: {t['completed_at'] or 'Not completed'}\n"
             f"------------------------------\n"
         )
-    _send_long_text(message.chat.id, text)
+    _send_long_text(message.chat.id, text, user_id=message.from_user.id)
 
 
 @bot.message_handler(commands=["continue"])
@@ -2940,7 +3337,7 @@ def cmd_continue(message):
             (uid,),
         ).fetchone()
         if active:
-            bot.reply_to(
+            reply_notice(
                 message,
                 f"⚠️ You already have task #{active['id']} pending/running. "
                 "Wait or /cancel first.",
@@ -2959,7 +3356,7 @@ def cmd_continue(message):
             (uid,),
         ).fetchone()
         if not row:
-            bot.reply_to(
+            reply_notice(
                 message,
                 "ℹ️ No failed task to continue. Use /download for a new novel.",
             )
@@ -2977,7 +3374,7 @@ def cmd_continue(message):
         )
         conn.commit()
         title = row["novel_title"] or row["url"]
-        bot.reply_to(
+        reply_notice(
             message,
             f"✅ Re-queued task #{row['id']} [{row['status']}→pending]\n"
             f"📖 {title}\n"
@@ -2994,13 +3391,14 @@ def cmd_logs(message):
     if deny_if_needed(message):
         return
     if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ Access Denied.")
+        reply_notice(message, "❌ Access Denied.")
         return
     conn = local_db()
     try:
         rows = conn.execute(
             """
-            SELECT id, user_id, username, status, url, chapter_range,
+            SELECT id, user_id, username, first_name, last_name,
+                   status, url, chapter_range,
                    novel_title, created_at, completed_at
             FROM tasks
             ORDER BY id ASC
@@ -3010,17 +3408,19 @@ def cmd_logs(message):
         conn.close()
 
     if not rows:
-        bot.reply_to(message, "ℹ️ No task logs found.")
+        reply_notice(message, "ℹ️ No task logs found.")
         return
 
     text = "📜 Task Logs (with user details):\n\n"
     for t in rows:
         username = f"@{t['username']}" if t["username"] else "N/A"
+        first = t["first_name"] or "N/A"
+        last = t["last_name"] or "N/A"
         text += (
             f"🆔 Task ID: {t['id']}\n"
             f"👤 User ID: {t['user_id']}\n"
             f"🔗 Username: {username}\n"
-            f"📛 Name: N/A N/A\n"
+            f"📛 Name: {first} {last}\n"
             f"🖥 Server: local\n"
             f"⚙️ Crawler: wtr_local\n"
             f"📌 Status: {t['status']}\n"
@@ -3030,7 +3430,7 @@ def cmd_logs(message):
             f"✅ Completed: {t['completed_at'] or 'Not completed'}\n"
             f"-----------------------------\n"
         )
-    _send_long_text(message.chat.id, text)
+    _send_long_text(message.chat.id, text, user_id=message.from_user.id)
 
 
 @bot.message_handler(commands=["trial"])
@@ -3039,7 +3439,7 @@ def cmd_trial(message):
     if deny_if_needed(message):
         return
     if not is_admin(message.from_user.id):
-        bot.reply_to(message, "❌ Access Denied.")
+        reply_notice(message, "❌ Access Denied.")
         return
     conn = local_db()
     try:
@@ -3055,7 +3455,7 @@ def cmd_trial(message):
         conn.close()
 
     if not rows:
-        bot.reply_to(message, "ℹ️ Queue is empty.")
+        reply_notice(message, "ℹ️ Queue is empty.")
         return
 
     text = "📋 All trial in Table:\n\n"
@@ -3072,7 +3472,7 @@ def cmd_trial(message):
             f"✅ Completed: {t['completed_at'] or 'Not completed'}\n"
             f"------------------------------\n"
         )
-    _send_long_text(message.chat.id, text)
+    _send_long_text(message.chat.id, text, user_id=message.from_user.id)
 
 
 @bot.message_handler(commands=["cap"])
@@ -3092,7 +3492,7 @@ def cmd_cap(message):
             "Set <code>CHAPTER_CAP=0</code> in .env for unlimited, then restart. "
             "Or UPDATE settings in SQLite."
         )
-    bot.reply_to(message, text, parse_mode="HTML")
+    reply_notice(message, text, parse_mode="HTML")
 
 
 @bot.message_handler(commands=["queue"])
@@ -3116,7 +3516,7 @@ def cmd_queue(message):
         conn.close()
 
     if not rows:
-        bot.reply_to(message, "ℹ️ Queue is empty.")
+        reply_notice(message, "ℹ️ Queue is empty.")
         return
 
     text = "📋 Pending trial Queue:\n\n"
@@ -3132,7 +3532,7 @@ def cmd_queue(message):
             f"🕒 Created: {t['created_at']}\n"
             f"-----------------------------\n"
         )
-    _send_long_text(message.chat.id, text)
+    _send_long_text(message.chat.id, text, user_id=message.from_user.id)
 
 
 @bot.message_handler(commands=["cancel"])
@@ -3142,9 +3542,9 @@ def cmd_cancel(message):
     n = cancel_user_tasks(message.from_user.id)
     pending_download.pop(message.from_user.id, None)
     if n:
-        bot.reply_to(message, f"✅ Cancelled {n} task(s).")
+        reply_notice(message, f"✅ Cancelled {n} task(s).")
     else:
-        bot.reply_to(message, "ℹ️ Nothing to cancel.")
+        reply_notice(message, "ℹ️ Nothing to cancel.")
 
 
 @bot.message_handler(commands=["download"])
@@ -3152,7 +3552,7 @@ def cmd_download(message):
     if deny_if_needed(message):
         return
     pending_download[message.from_user.id] = {"step": "url"}
-    bot.reply_to(
+    reply_notice(
         message,
         "📌 Send a WTR-Lab novel URL.\n"
         "Example:\n"
@@ -3176,7 +3576,7 @@ def on_text(message):
 
     if state.get("step") == "url":
         if not is_wtr_url(text):
-            bot.reply_to(
+            reply_notice(
                 message,
                 "🚫 Only wtr-lab.com links work with this bot.\n"
                 "Send a valid URL or /cancel.",
@@ -3209,18 +3609,20 @@ def on_text(message):
                 "↔️ Custom range", callback_data="range_custom"
             ),
         )
-        bot.send_message(
+        msg = telegram_call(
+            bot.send_message,
             message.chat.id,
             range_help,
             reply_markup=markup,
         )
+        track_and_autodelete(msg, uid, DELETE_AFTER_NOTICE)
         return
 
     if state.get("step") == "custom_range":
         url = state.get("url")
         pending_download.pop(uid, None)
         if not url:
-            bot.reply_to(message, "Session expired. Send /download again.")
+            reply_notice(message, "Session expired. Send /download again.")
             return
         task_id, err = insert_task(
             chat_id=message.chat.id,
@@ -3228,11 +3630,13 @@ def on_text(message):
             url=url,
             chapter_range=text,
             username=message.from_user.username,
+            first_name=message.from_user.first_name,
+            last_name=message.from_user.last_name,
         )
         if err:
-            bot.reply_to(message, f"❌ {err}")
+            reply_notice(message, f"❌ {err}")
             return
-        bot.reply_to(
+        reply_notice(
             message,
             f"✅ Queued task #{task_id}.\n"
             "The local worker will process it and send the EPUB here.",
@@ -3258,11 +3662,13 @@ def on_range_choice(call):
 
     if call.data == "range_custom":
         state["step"] = "custom_range"
-        bot.send_message(
+        msg = telegram_call(
+            bot.send_message,
             call.message.chat.id,
             "↔️ Send the range, e.g. <code>40-60</code> or <code>40 60</code>",
             parse_mode="HTML",
         )
+        track_and_autodelete(msg, uid, DELETE_AFTER_NOTICE)
         bot.answer_callback_query(call.id)
         return
 
@@ -3274,14 +3680,17 @@ def on_range_choice(call):
         url=url,
         chapter_range="all",
         username=call.from_user.username,
+        first_name=call.from_user.first_name,
+        last_name=call.from_user.last_name,
     )
     if err:
-        bot.send_message(call.message.chat.id, f"❌ {err}")
+        send_notice(call.message.chat.id, f"❌ {err}", user_id=uid)
     else:
-        bot.send_message(
+        send_notice(
             call.message.chat.id,
             f"✅ Queued task #{task_id}.\n"
             "The local worker will process it and send the EPUB here.",
+            user_id=uid,
         )
     bot.answer_callback_query(call.id)
 
@@ -3340,6 +3749,7 @@ def worker_loop():
 
 
 def main():
+    """Full mode: SQLite worker + Telegram polling (users can queue tasks)."""
     setup_local_db()
 
     worker = threading.Thread(target=worker_loop, name="wtr-worker", daemon=True)
@@ -3353,6 +3763,26 @@ def main():
     finally:
         stop_event.set()
         worker.join(timeout=15)
+
+
+def worker_main():
+    """
+    Worker-only mode: process pending/running tasks already in SQLite.
+    Does NOT start Telegram polling — users cannot queue new tasks via chat.
+    Still uses BOT_TOKEN to *send* progress / EPUB for tasks already in the DB.
+    """
+    setup_local_db()
+    print(
+        "[MODE] worker-only — no Telegram polling "
+        "(chat cannot queue new tasks)"
+    )
+    print("       Drains existing pending tasks in SQLite; Ctrl+C to stop.")
+    try:
+        worker_loop()
+    except KeyboardInterrupt:
+        print("\nStopping worker…")
+    finally:
+        stop_event.set()
 
 
 if __name__ == "__main__":
