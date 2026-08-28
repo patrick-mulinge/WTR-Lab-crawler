@@ -40,7 +40,7 @@ $ReqFile    = Join-Path $ProjectRoot "requirements.txt"
 $AppFile    = Join-Path $ProjectRoot "app.py"
 $Marker     = Join-Path $ProjectRoot "data\.setup_done"
 
-$GithubZipUrl = "https://github.com/patrick-mulinge/WTR-Lab-crawler/archive/refs/heads/main.zip"
+$GithubZipUrl = "https://github.com/patrick-mulinge/WTR-Lab-crawler/archive/refs/heads/headless.zip"
 
 function Write-Info($msg)  { Write-Host "[*] $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)    { Write-Host "[+] $msg" -ForegroundColor Green }
@@ -258,6 +258,11 @@ function Ensure-EnvFile {
     if ($daily -notmatch '^\d+$') { $daily = "0" }
 
     Write-Host ""
+    Write-Host "HEADLESS - 1 = no Chrome window (default). 0 = visible window (needed to click Turnstile)."
+    $headless = Read-EnvDefault "HEADLESS" "1"
+    if ($headless -notmatch '^[01]$') { $headless = "1" }
+
+    Write-Host ""
     Write-Host "Chapter delay (seconds). Defaults 10-18 are safer against Cloudflare."
     $tmin = Read-EnvDefault "CHAPTER_THROTTLE_MIN" "10"
     $tmax = Read-EnvDefault "CHAPTER_THROTTLE_MAX" "18"
@@ -273,6 +278,7 @@ CHAPTER_THROTTLE_MIN=$tmin
 CHAPTER_THROTTLE_MAX=$tmax
 PROGRESS_UPDATE_SECONDS=25
 CHROME_PROFILE_DIR=data/chrome-profile
+HEADLESS=$headless
 "@
     Set-Content -Path $EnvFile -Value $content -Encoding UTF8
     Write-Ok ".env written."
@@ -296,9 +302,9 @@ function Test-SetupDone {
 
 function Stop-ChromeIfNeeded {
     Write-Host ""
-    Write-Warn "Close other Chrome windows before the worker starts."
-    Write-Host "The worker uses its own profile under data\chrome-profile."
-    $ans = Read-Host "Try to close all Chrome processes now? (y/N)"
+    Write-Warn "Headless mode does not open a Chrome window."
+    Write-Host "The worker still uses its own profile under data\chrome-profile."
+    $ans = Read-Host "Close other Chrome processes anyway? (y/N)"
     if ($ans -match '^[Yy]') {
         Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
@@ -339,8 +345,8 @@ Stop-ChromeIfNeeded
 
 Write-Host ""
 Write-Info "Starting app.py ..."
-Write-Host "Log into WTR-Lab in the Chrome window if asked."
-Write-Host "Leave the mouse alone if a Turnstile challenge is being auto-solved."
+Write-Host "HEADLESS=1 by default — no Chrome window."
+Write-Host "If Turnstile keeps failing, set HEADLESS=0 in .env and restart."
 Write-Host "Press Ctrl+C in this window to stop."
 Write-Host ""
 
