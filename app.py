@@ -159,7 +159,7 @@ LOW_RAM_CHROME_ARGS = ",".join(
         "--disable-notifications",
         "--disable-speech-api",
         "--disable-file-system",
-        "--disable-features=Translate,TranslateUI,AudioServiceOutOfProcess>
+        "--disable-features=Translate,TranslateUI,AudioServiceOutOfProcess>",
         "--disable-site-isolation-trials",
         "--renderer-process-limit=2",
         "--mute-audio",
