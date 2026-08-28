@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-# WTR-Lab local worker — automatic Linux setup + start app.py
+# WTR-Lab local worker — Oracle Linux / RHEL / Rocky / Alma (dnf only)
 #
 # Usage:
 #   chmod +x "Start for Linux.sh"
 #   ./"Start for Linux.sh"
 #
 # Supported:
-#   - Oracle Linux 8/9 (dnf)  ← primary target for a new VPS
+#   - Oracle Linux 8/9 (dnf)
 #   - RHEL / Rocky / Alma / CentOS Stream (dnf)
-#   - Ubuntu / Debian / Linux Mint (apt)
 #
 # IMPORTANT:
 #   Run this script WITHOUT sudo.
@@ -34,9 +33,6 @@ MARKER="./data/.setup_done"
 # Optional GitHub zip URL if the project folder is incomplete.
 GITHUB_ZIP_URL=""
 
-# Detected at runtime
-PKG_MGR=""          # dnf | apt
-OS_FAMILY=""        # rhel | debian
 IS_INTERACTIVE=0
 
 info()  { echo "[*] $*"; }
@@ -48,14 +44,6 @@ err()   { echo "[x] $*" >&2; }
 # =========================================================
 # INTERACTIVE / TTY DETECTION
 # =========================================================
-# Why .env prompts can fail on a VPS:
-#   - `read -p` needs stdin attached to a terminal (TTY).
-#   - systemd services, cloud-init, `ssh host 'cmd'`, nohup, and pipes
-#     often have no TTY → read gets EOF / empty string immediately.
-#   - With set -euo pipefail, a failed or empty required read can abort
-#     the script or write a broken .env.
-# Fix: detect TTY; if non-interactive, require BOT_TOKEN from the
-# environment or an existing .env instead of prompting.
 
 detect_interactive() {
   if [[ -t 0 ]] && [[ -t 1 ]]; then
@@ -67,9 +55,6 @@ detect_interactive() {
 
 
 prompt_or_env() {
-  # prompt_or_env VAR "Prompt text" "default"
-  # If already set in the environment, keep it.
-  # If interactive, ask. Otherwise use default (may be empty).
   local var="$1"
   local prompt="$2"
   local default="${3-}"
@@ -171,7 +156,7 @@ ensure_project() {
 
 
 # =========================================================
-# OPERATING SYSTEM + PACKAGE MANAGER
+# OPERATING SYSTEM CHECK (dnf only)
 # =========================================================
 
 detect_os() {
@@ -183,62 +168,13 @@ detect_os() {
   # shellcheck disable=SC1091
   source /etc/os-release
 
-  local id_like_lower
-  id_like_lower="$(echo "${ID_LIKE:-} ${ID:-}" | tr '[:upper:]' '[:lower:]')"
-
-  case "${ID:-}" in
-    ol|oracle|rhel|centos|rocky|almalinux|fedora)
-      OS_FAMILY="rhel"
-      ;;
-    ubuntu|debian|linuxmint|pop|elementary|zorin)
-      OS_FAMILY="debian"
-      ;;
-    *)
-      if echo "$id_like_lower" | grep -Eq 'rhel|fedora|centos'; then
-        OS_FAMILY="rhel"
-      elif echo "$id_like_lower" | grep -Eq 'debian|ubuntu'; then
-        OS_FAMILY="debian"
-      else
-        OS_FAMILY="unknown"
-      fi
-      ;;
-  esac
-
-  if command -v dnf >/dev/null 2>&1; then
-    PKG_MGR="dnf"
-  elif command -v yum >/dev/null 2>&1; then
-    PKG_MGR="yum"
-  elif command -v apt-get >/dev/null 2>&1; then
-    PKG_MGR="apt"
-  else
-    PKG_MGR=""
-  fi
-
-  # Prefer family match when both tools somehow exist
-  if [[ "$OS_FAMILY" == "rhel" ]] && command -v dnf >/dev/null 2>&1; then
-    PKG_MGR="dnf"
-  elif [[ "$OS_FAMILY" == "rhel" ]] && command -v yum >/dev/null 2>&1; then
-    PKG_MGR="yum"
-  elif [[ "$OS_FAMILY" == "debian" ]] && command -v apt-get >/dev/null 2>&1; then
-    PKG_MGR="apt"
-  fi
-
-  if [[ -z "$PKG_MGR" ]]; then
-    err "No supported package manager found (need dnf, yum, or apt-get)."
+  if ! command -v dnf >/dev/null 2>&1; then
+    err "This script requires dnf (Oracle Linux / RHEL / Rocky / Alma)."
+    err "Detected package manager is missing or not dnf."
     exit 1
   fi
 
-  ok "OS: ${PRETTY_NAME:-$ID}  family=$OS_FAMILY  pkg=$PKG_MGR"
-
-  if [[ "$OS_FAMILY" == "unknown" ]]; then
-    warn "Unrecognized distribution. Continuing with $PKG_MGR."
-    if [[ "$IS_INTERACTIVE" -eq 1 ]]; then
-      read -r -p "Continue anyway? [y/N]: " answer || true
-      if [[ ! "${answer:-}" =~ ^[Yy]$ ]]; then
-        exit 1
-      fi
-    fi
-  fi
+  ok "OS: ${PRETTY_NAME:-$ID}  (dnf)"
 }
 
 
@@ -270,24 +206,13 @@ ensure_sudo() {
 
 
 # =========================================================
-# PACKAGE INSTALLERS
+# PACKAGE INSTALLERS (dnf only)
 # =========================================================
 
 PKG_UPDATED=0
 
 pkg_installed() {
-  local package="$1"
-  case "$PKG_MGR" in
-    dnf|yum)
-      rpm -q "$package" >/dev/null 2>&1
-      ;;
-    apt)
-      dpkg -s "$package" >/dev/null 2>&1
-      ;;
-    *)
-      return 1
-      ;;
-  esac
+  rpm -q "$1" >/dev/null 2>&1
 }
 
 
@@ -309,30 +234,11 @@ pkg_install() {
 
   info "Installing: ${missing[*]}"
 
-  case "$PKG_MGR" in
-    dnf)
-      if [[ $PKG_UPDATED -eq 0 ]]; then
-        sudo dnf -y makecache || true
-        PKG_UPDATED=1
-      fi
-      sudo dnf install -y "${missing[@]}"
-      ;;
-    yum)
-      if [[ $PKG_UPDATED -eq 0 ]]; then
-        sudo yum -y makecache || true
-        PKG_UPDATED=1
-      fi
-      sudo yum install -y "${missing[@]}"
-      ;;
-    apt)
-      if [[ $PKG_UPDATED -eq 0 ]]; then
-        info "Updating package lists..."
-        sudo apt-get update
-        PKG_UPDATED=1
-      fi
-      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}"
-      ;;
-  esac
+  if [[ $PKG_UPDATED -eq 0 ]]; then
+    sudo dnf -y makecache || true
+    PKG_UPDATED=1
+  fi
+  sudo dnf install -y "${missing[@]}"
 }
 
 
@@ -342,23 +248,7 @@ pkg_install() {
 
 ensure_basic_tools() {
   info "Checking required system tools..."
-
-  case "$PKG_MGR" in
-    dnf|yum)
-      # gnupg2 is the RHEL name; unzip/curl often already present on OL images
-      pkg_install ca-certificates curl wget unzip gnupg2
-      ;;
-    apt)
-      pkg_install \
-        ca-certificates \
-        curl \
-        wget \
-        unzip \
-        gnupg \
-        software-properties-common
-      ;;
-  esac
-
+  pkg_install ca-certificates curl wget unzip gnupg2
   ok "Basic system tools ready."
 }
 
@@ -379,46 +269,33 @@ ensure_python() {
   else
     warn "Python 3.10+ not found (or too old). Installing..."
 
-    case "$PKG_MGR" in
-      dnf|yum)
-        # OL9 / RHEL9: python3 is typically 3.9+; OL8 may need a module.
-        # Try base packages first, then common module streams.
-        pkg_install python3 python3-pip python3-devel || true
+    # OL9 / RHEL9: python3 is usually recent enough.
+    # OL8 may need module streams.
+    pkg_install python3 python3-pip python3-devel || true
 
-        if ! python_version_ok; then
-          info "Trying Python module streams (Oracle Linux 8 style)..."
-          if command -v dnf >/dev/null 2>&1; then
-            # Best-effort: ignore failure if modules are unavailable
-            sudo dnf module enable -y python39 2>/dev/null || true
-            sudo dnf module enable -y python3.11 2>/dev/null || true
-            sudo dnf module enable -y python3.12 2>/dev/null || true
-            sudo dnf install -y python39 python39-pip python39-devel 2>/dev/null || true
-            sudo dnf install -y python3.11 python3.11-pip python3.11-devel 2>/dev/null || true
-            sudo dnf install -y python3.12 python3.12-pip python3.12-devel 2>/dev/null || true
+    if ! python_version_ok; then
+      info "Trying Python module streams (Oracle Linux 8 style)..."
+      sudo dnf module enable -y python39 2>/dev/null || true
+      sudo dnf module enable -y python3.11 2>/dev/null || true
+      sudo dnf module enable -y python3.12 2>/dev/null || true
+      sudo dnf install -y python39 python39-pip python39-devel 2>/dev/null || true
+      sudo dnf install -y python3.11 python3.11-pip python3.11-devel 2>/dev/null || true
+      sudo dnf install -y python3.12 python3.12-pip python3.12-devel 2>/dev/null || true
 
-            # Prefer newest available python3.x on PATH for venv creation
-            for cand in python3.12 python3.11 python3.10 python3.9 python3; do
-              if command -v "$cand" >/dev/null 2>&1; then
-                if "$cand" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
-                  # Create a convenience python3 symlink only inside later venv
-                  export WTR_PYTHON_BIN="$cand"
-                  break
-                fi
-              fi
-            done
+      for cand in python3.12 python3.11 python3.10 python3.9 python3; do
+        if command -v "$cand" >/dev/null 2>&1; then
+          if "$cand" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
+            export WTR_PYTHON_BIN="$cand"
+            break
           fi
         fi
+      done
+    fi
 
-        # Build deps some pip wheels need on RHEL
-        pkg_install gcc gcc-c++ make libffi-devel openssl-devel 2>/dev/null || true
-        ;;
-      apt)
-        pkg_install python3 python3-venv python3-pip python3-dev
-        ;;
-    esac
+    # Build deps some pip wheels need
+    pkg_install gcc gcc-c++ make libffi-devel openssl-devel 2>/dev/null || true
   fi
 
-  # Resolve which python binary to use for venv
   if [[ -z "${WTR_PYTHON_BIN:-}" ]]; then
     if command -v python3 >/dev/null 2>&1; then
       WTR_PYTHON_BIN="python3"
@@ -432,18 +309,9 @@ ensure_python() {
   ver="$("$WTR_PYTHON_BIN" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
   ok "Using $WTR_PYTHON_BIN ($ver) for the virtual environment."
 
-  # venv module
   if ! "$WTR_PYTHON_BIN" -m venv --help >/dev/null 2>&1; then
     info "Ensuring venv module is available..."
-    case "$PKG_MGR" in
-      dnf|yum)
-        # On RHEL, venv is usually part of the python3 package itself
-        pkg_install python3 || true
-        ;;
-      apt)
-        pkg_install python3-venv
-        ;;
-    esac
+    pkg_install python3 || true
   fi
 
   if ! "$WTR_PYTHON_BIN" -m venv --help >/dev/null 2>&1; then
@@ -452,16 +320,8 @@ ensure_python() {
     exit 1
   fi
 
-  # Ensure pip exists for system python (helpful diagnostics only)
   if ! "$WTR_PYTHON_BIN" -m pip --version >/dev/null 2>&1; then
-    case "$PKG_MGR" in
-      dnf|yum)
-        pkg_install python3-pip || true
-        ;;
-      apt)
-        pkg_install python3-pip
-        ;;
-    esac
+    pkg_install python3-pip || true
   fi
 
   ok "Python environment ready."
@@ -482,15 +342,9 @@ chrome_arch() {
   local m
   m="$(uname -m)"
   case "$m" in
-    x86_64|amd64)
-      echo "x86_64"
-      ;;
-    aarch64|arm64)
-      echo "aarch64"
-      ;;
-    *)
-      echo "$m"
-      ;;
+    x86_64|amd64) echo "x86_64" ;;
+    aarch64|arm64) echo "aarch64" ;;
+    *) echo "$m" ;;
   esac
 }
 
@@ -514,49 +368,21 @@ ensure_chrome() {
   warn "Google Chrome not found."
   info "Installing Google Chrome..."
 
-  case "$PKG_MGR" in
-    dnf|yum)
-      local tmp_rpm
-      tmp_rpm="$(mktemp --suffix=.rpm)"
-      cleanup_chrome_rpm() { rm -f "$tmp_rpm"; }
-      trap cleanup_chrome_rpm EXIT
+  local tmp_rpm
+  tmp_rpm="$(mktemp --suffix=.rpm)"
+  cleanup_chrome_rpm() { rm -f "$tmp_rpm"; }
+  trap cleanup_chrome_rpm EXIT
 
-      info "Downloading Google Chrome RPM..."
-      curl -fL \
-        "https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm" \
-        -o "$tmp_rpm"
+  info "Downloading Google Chrome RPM..."
+  curl -fL \
+    "https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm" \
+    -o "$tmp_rpm"
 
-      info "Installing Google Chrome (dnf will pull dependencies)..."
-      if [[ "$PKG_MGR" == "dnf" ]]; then
-        sudo dnf install -y "$tmp_rpm"
-      else
-        sudo yum localinstall -y "$tmp_rpm"
-      fi
+  info "Installing Google Chrome (dnf will pull dependencies)..."
+  sudo dnf install -y "$tmp_rpm"
 
-      rm -f "$tmp_rpm"
-      trap - EXIT
-      ;;
-    apt)
-      local tmp_deb
-      tmp_deb="$(mktemp --suffix=.deb)"
-      cleanup_chrome_deb() { rm -f "$tmp_deb"; }
-      trap cleanup_chrome_deb EXIT
-
-      info "Downloading Google Chrome DEB..."
-      curl -fL \
-        "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb" \
-        -o "$tmp_deb"
-
-      info "Installing Google Chrome..."
-      sudo apt-get install -y "$tmp_deb" || {
-        # Resolve deps if dpkg left them broken
-        sudo apt-get install -f -y
-      }
-
-      rm -f "$tmp_deb"
-      trap - EXIT
-      ;;
-  esac
+  rm -f "$tmp_rpm"
+  trap - EXIT
 
   if chrome_installed; then
     CHROME_CMD="$(command -v google-chrome || command -v google-chrome-stable)"
@@ -651,7 +477,6 @@ ensure_env() {
   local daily="${DAILY_TASK_LIMIT:-0}"
   local tmin="${CHAPTER_THROTTLE_MIN:-10}"
   local tmax="${CHAPTER_THROTTLE_MAX:-18}"
-  # Default HEADLESS=1 on servers (no display). Override with export HEADLESS=0.
   local headless="${HEADLESS:-1}"
 
   if [[ "$IS_INTERACTIVE" -eq 1 ]]; then
@@ -812,7 +637,7 @@ detect_interactive
 
 echo
 echo "=========================================="
-echo "        WTR-Lab Local Worker"
+echo "        WTR-Lab Local Worker (dnf)"
 echo "=========================================="
 echo
 
