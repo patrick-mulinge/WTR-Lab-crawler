@@ -134,6 +134,8 @@ HEADLESS = _raw_headless not in ("0", "false", "no", "off")
 LOW_RAM_CHROME_ARGS = ",".join(
     [
         "--disable-gpu",
+        "--no-sandbox"
+        "--disable-dev-shm-usage"
         "--disable-gpu-compositing",
         "--disable-software-rasterizer",
         "--in-process-gpu",
@@ -157,16 +159,16 @@ LOW_RAM_CHROME_ARGS = ",".join(
         "--disable-notifications",
         "--disable-speech-api",
         "--disable-file-system",
-        "--disable-features=Translate,TranslateUI,AudioServiceOutOfProcess,MediaRouter,DialMediaRouteProvider,OptimizationHints,InterestFeedContentSuggestions,CalculateNativeWinOcclusion,AutofillServerCommunication,HeavyAdIntervention,PaintHolding,IsolateOrigins,site-per-process",
+        "--disable-features=Translate,TranslateUI,AudioServiceOutOfProcess>
         "--disable-site-isolation-trials",
-        "--renderer-process-limit=1",
+        "--renderer-process-limit=2",
         "--mute-audio",
         "--no-first-run",
         "--no-default-browser-check",
         "--no-pings",
         "--metrics-recording-only",
         "--blink-settings=imagesEnabled=false",
-        "--js-flags=--max-old-space-size=128",
+
     ]
 )
 
