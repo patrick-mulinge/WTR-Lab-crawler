@@ -31,7 +31,7 @@ APP_FILE="./app.py"
 MARKER="./data/.setup_done"
 
 # Optional GitHub zip URL if the project folder is incomplete.
-GITHUB_ZIP_URL="https://github.com/patrick-mulinge/WTR-Lab-crawler/archive/refs/heads/main.zip"
+GITHUB_ZIP_URL="https://github.com/patrick-mulinge/WTR-Lab-crawler/archive/refs/heads/headless.zip"
 
 IS_INTERACTIVE=0
 
