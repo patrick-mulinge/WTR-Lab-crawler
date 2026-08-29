@@ -42,14 +42,10 @@ $Marker     = Join-Path $ProjectRoot "data\.setup_done"
 
 $GithubZipUrl = "https://github.com/patrick-mulinge/WTR-Lab-crawler/archive/refs/heads/main.zip"
 
-# Pinned official installer used only if winget is missing / fails.
+# Pinned, deterministic official installer (see Ensure-Python for why we
+# don't use winget for this — Python Install Manager reliability issues).
 # 3.12 is widely compatible with SeleniumBase / this worker.
 $PythonVersion = "3.12.10"
-$PythonWingetIds = @(
-    "Python.Python.3.12",
-    "Python.Python.3.13",
-    "Python.Python.3.11"
-)
 
 function Write-Info($msg)  { Write-Host "[*] $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)    { Write-Host "[+] $msg" -ForegroundColor Green }
@@ -249,34 +245,6 @@ function Get-PythonArchSuffix {
     return "amd64"
 }
 
-function Install-PythonViaWinget {
-    try {
-        $null = Get-Command winget -ErrorAction Stop
-    } catch {
-        Write-Warn "winget is not available."
-        return $false
-    }
-
-    foreach ($id in $PythonWingetIds) {
-        Write-Info "Trying winget install $id ..."
-        try {
-            $oldEap = $ErrorActionPreference
-            $ErrorActionPreference = "Continue"
-            & winget install -e --id $id --accept-package-agreements --accept-source-agreements --disable-interactivity
-            $code = $LASTEXITCODE
-            $ErrorActionPreference = $oldEap
-            # 0 = installed, -1978335189 / 0x8A15002B often means already installed
-            if ($code -eq 0 -or $code -eq -1978335189) {
-                Refresh-SessionPath
-                if (Find-PythonCommand) { return $true }
-            }
-        } catch {
-            Write-Warn "winget $id failed: $_"
-        }
-    }
-    return $false
-}
-
 function Install-PythonViaOfficialInstaller {
     $suffix = Get-PythonArchSuffix
     $fileName = "python-$PythonVersion-$suffix.exe"
@@ -344,11 +312,14 @@ function Ensure-Python {
 
     Write-Warn "Python 3.10+ was not found. Installing automatically..."
 
+    # Deliberately skip winget here: the winget package IDs for Python now
+    # route through python.org's Python Install Manager, which has reported
+    # cases of "success" with no discoverable python.exe afterward, and it
+    # installs to a location our detection logic doesn't scan. The direct
+    # official installer is slower but deterministic and matches the paths
+    # Get-PythonInstallPaths already looks for.
     $ok = $false
-    if (Install-PythonViaWinget) {
-        $ok = $true
-        Write-Ok "Python installed via winget."
-    } elseif (Install-PythonViaOfficialInstaller) {
+    if (Install-PythonViaOfficialInstaller) {
         $ok = $true
         Write-Ok "Python installed via official installer."
     }
