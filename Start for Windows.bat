@@ -6,16 +6,6 @@ cd /d "%~dp0"
 REM ============================================================
 REM WTR-Lab Local Worker
 REM ============================================================
-REM
-REM This BAT contains the PowerShell setup logic below.
-REM
-REM Direct downloads use Windows curl.exe:
-REM   - Python installer
-REM   - Google Chrome installer
-REM   - GitHub project ZIP
-REM
-REM pip continues to use pip for Python packages.
-REM ============================================================
 
 set "WTR_PROJECT_ROOT=%CD%"
 
@@ -29,9 +19,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
 set "ERR=%ERRORLEVEL%"
 
 if not "%ERR%"=="0" (
-    echo.
-    echo Script exited with code %ERR%.
-    pause
+  echo.
+  echo Script exited with code %ERR%.
+  pause
 )
 
 endlocal
@@ -42,15 +32,9 @@ __WTR_PS_BODY_BEGIN__
 
 # ============================================================
 # WTR-Lab local worker
-# Setup once, then start app.py
 # ============================================================
 
 $ErrorActionPreference = "Stop"
-
-
-# ============================================================
-# Project root
-# ============================================================
 
 $ProjectRoot = $env:WTR_PROJECT_ROOT
 
@@ -76,7 +60,7 @@ $Marker     = Join-Path $ProjectRoot "data\.setup_done"
 
 
 # ============================================================
-# Download URLs
+# URLs
 # ============================================================
 
 $GithubZipUrl = "https://github.com/patrick-mulinge/WTR-Lab-crawler/archive/refs/heads/main.zip"
@@ -87,7 +71,7 @@ $PythonVersion = "3.12.10"
 
 
 # ============================================================
-# Output helpers
+# Output functions
 # ============================================================
 
 function Write-Info($msg) {
@@ -113,36 +97,27 @@ function Write-Err($msg) {
 
 function Get-CurlPath {
 
-    # Windows 10/11 normally has curl here.
-    $systemCurl = Join-Path `
-        $env:SystemRoot `
-        "System32\curl.exe"
-
+    $systemCurl = Join-Path $env:SystemRoot "System32\curl.exe"
 
     if (Test-Path -LiteralPath $systemCurl) {
         return $systemCurl
     }
 
-
-    # Fallback: search PATH.
     try {
+        $curl = Get-Command curl.exe -ErrorAction Stop
 
-        $cmd = Get-Command `
-            curl.exe `
-            -ErrorAction Stop
-
-        if ($cmd.Source) {
-            return $cmd.Source
+        if ($curl.Source) {
+            return $curl.Source
         }
     }
-    catch { }
+    catch {
+    }
 
-
-    Write-Err "Windows curl.exe was not found."
+    Write-Err "curl.exe was not found."
 
     Write-Host ""
-    Write-Host "This script requires curl.exe."
-    Write-Host "On normal Windows 10/11 installations it is included."
+    Write-Host "Windows 10/11 normally includes curl.exe."
+    Write-Host "Please make sure C:\Windows\System32 is available."
     Write-Host ""
 
     exit 1
@@ -153,7 +128,7 @@ $Curl = Get-CurlPath
 
 
 # ============================================================
-# Generic curl downloader
+# Download using curl
 # ============================================================
 
 function Download-With-Curl {
@@ -165,7 +140,8 @@ function Download-With-Curl {
         [Parameter(Mandatory = $true)]
         [string]$OutputFile,
 
-        [string]$Description = "file"
+        [Parameter(Mandatory = $true)]
+        [string]$Description
     )
 
 
@@ -174,7 +150,6 @@ function Download-With-Curl {
     Write-Host ""
 
 
-    # Remove incomplete previous download.
     if (Test-Path -LiteralPath $OutputFile) {
 
         Remove-Item `
@@ -192,7 +167,7 @@ function Download-With-Curl {
             --show-error `
             --retry 3 `
             --retry-delay 2 `
-            --connect-timeout 20 `
+            --connect-timeout 30 `
             -o $OutputFile `
             $Url
 
@@ -237,7 +212,7 @@ function Download-With-Curl {
 
     if ($size -lt 1KB) {
 
-        Write-Err "$Description download appears to be empty or invalid."
+        Write-Err "$Description download appears invalid."
 
         Remove-Item `
             -LiteralPath $OutputFile `
@@ -261,7 +236,7 @@ function Download-With-Curl {
 
 
 # ============================================================
-# Project files
+# Project check
 # ============================================================
 
 function Test-ProjectComplete {
@@ -272,6 +247,10 @@ function Test-ProjectComplete {
     )
 }
 
+
+# ============================================================
+# Download project from GitHub
+# ============================================================
 
 function Ensure-ProjectFiles {
 
@@ -287,10 +266,14 @@ function Ensure-ProjectFiles {
     if (-not $GithubZipUrl) {
 
         Write-Err "Cannot auto-download (no GitHub URL configured)."
+
         Write-Host "Copy the full project folder here, then run again."
 
         exit 1
     }
+
+
+    Write-Info "Downloading project from GitHub..."
 
 
     $tmpZip = Join-Path `
@@ -306,16 +289,16 @@ function Ensure-ProjectFiles {
     try {
 
         # ====================================================
-        # GitHub ZIP now uses curl.exe
+        # GitHub ZIP uses curl.exe
         # ====================================================
 
-        $downloaded = Download-With-Curl `
+        $ok = Download-With-Curl `
             -Url $GithubZipUrl `
             -OutputFile $tmpZip `
-            -Description "WTR-Lab project from GitHub"
+            -Description "WTR-Lab project"
 
 
-        if (-not $downloaded) {
+        if (-not $ok) {
 
             exit 1
         }
@@ -371,7 +354,7 @@ function Ensure-ProjectFiles {
     }
     catch {
 
-        Write-Err "Project setup failed: $_"
+        Write-Err "Download failed: $_"
 
         exit 1
     }
@@ -400,6 +383,7 @@ function Ensure-ProjectFiles {
     if (-not (Test-ProjectComplete)) {
 
         Write-Err "Still missing app.py after download."
+
         Write-Host "    Expected: $AppFile"
 
         exit 1
@@ -431,13 +415,18 @@ function Test-ChromeInstalled {
 
     try {
 
-        $null = Get-Command `
-            chrome `
+        $chrome = Get-Command `
+            chrome.exe `
             -ErrorAction Stop
 
-        return $true
+
+        if ($chrome.Source) {
+
+            return $true
+        }
     }
-    catch { }
+    catch {
+    }
 
 
     return $false
@@ -447,10 +436,9 @@ function Test-ChromeInstalled {
 # ============================================================
 # Install Chrome
 #
-# No winget.
-# No Invoke-WebRequest.
-#
-# Uses direct official Google Chrome download via curl.exe.
+# Uses curl.exe.
+# Does NOT use winget.
+# Does NOT use Invoke-WebRequest.
 # ============================================================
 
 function Install-Chrome {
@@ -462,27 +450,24 @@ function Install-Chrome {
 
     Write-Info "Downloading official Google Chrome installer..."
 
-    Write-Host "    This installer is approximately 155 MB."
+    Write-Host "    The installer is approximately 155 MB."
     Write-Host ""
 
 
-    $downloaded = Download-With-Curl `
+    $ok = Download-With-Curl `
         -Url $ChromeUrl `
         -OutputFile $ChromeInstaller `
         -Description "Google Chrome installer"
 
 
-    if (-not $downloaded) {
+    if (-not $ok) {
 
         Write-Err "Chrome download failed."
 
         Write-Host ""
-        Write-Host "You can install Chrome manually from:"
+        Write-Host "Install Chrome manually from:"
         Write-Host "https://www.google.com/chrome/"
         Write-Host ""
-
-        Start-Process `
-            "https://www.google.com/chrome/"
 
         exit 1
     }
@@ -511,7 +496,6 @@ function Install-Chrome {
 
         Write-Err "Chrome installation failed: $_"
 
-
         Remove-Item `
             -LiteralPath $ChromeInstaller `
             -Force `
@@ -519,44 +503,6 @@ function Install-Chrome {
 
         exit 1
     }
-
-
-    # ========================================================
-    # Verify installation
-    # ========================================================
-
-    Start-Sleep `
-        -Seconds 3
-
-
-    Refresh-SessionPath
-
-
-    if (Test-ChromeInstalled) {
-
-        Write-Ok "Chrome installed successfully."
-
-
-        Remove-Item `
-            -LiteralPath $ChromeInstaller `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-
-        return
-    }
-
-
-    # ========================================================
-    # Second check
-    # ========================================================
-
-    Write-Warn `
-        "Chrome was not detected immediately after installation."
-
-
-    Write-Info `
-        "Checking Chrome installation paths again..."
 
 
     Start-Sleep `
@@ -570,24 +516,40 @@ function Install-Chrome {
 
         Write-Ok "Chrome installed successfully."
 
+        Remove-Item `
+            -LiteralPath $ChromeInstaller `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+        return
+    }
+
+
+    Write-Warn `
+        "Chrome installer finished but Chrome was not detected immediately."
+
+
+    Start-Sleep `
+        -Seconds 5
+
+
+    Refresh-SessionPath
+
+
+    if (Test-ChromeInstalled) {
+
+        Write-Ok "Chrome installed successfully."
 
         Remove-Item `
             -LiteralPath $ChromeInstaller `
             -Force `
             -ErrorAction SilentlyContinue
 
-
         return
     }
 
 
-    # ========================================================
-    # Failure
-    # ========================================================
-
-    Write-Err `
-        "Chrome installation did not complete."
-
+    Write-Err "Chrome installation did not complete."
 
     Write-Host ""
     Write-Host "Install Chrome manually from:"
@@ -601,13 +563,13 @@ function Install-Chrome {
         -ErrorAction SilentlyContinue
 
 
-    Start-Process `
-        "https://www.google.com/chrome/"
-
-
     exit 1
 }
 
+
+# ============================================================
+# Ensure Chrome
+# ============================================================
 
 function Ensure-Chrome {
 
@@ -680,84 +642,30 @@ function Refresh-SessionPath {
 
 
 # ============================================================
-# Python command execution
-# ============================================================
-
-function Invoke-PythonCmd {
-
-    param(
-        [Parameter(Mandatory = $true)]
-        [string[]]$Command,
-
-        [Parameter(ValueFromRemainingArguments = $true)]
-        [string[]]$Rest
-    )
-
-
-    $exe = $Command[0]
-
-
-    $argsList = New-Object `
-        System.Collections.Generic.List[string]
-
-
-    if ($Command.Count -gt 1) {
-
-        foreach (
-            $item in $Command[1..($Command.Count - 1)]
-        ) {
-
-            [void]$argsList.Add($item)
-        }
-    }
-
-
-    if ($Rest) {
-
-        foreach ($item in $Rest) {
-
-            [void]$argsList.Add($item)
-        }
-    }
-
-
-    & $exe @argsList
-}
-
-
-# ============================================================
-# Python version check
+# PYTHON DETECTION
+#
+# IMPORTANT:
+# We directly execute python.exe --version.
+#
+# This avoids the previous bug where your working Python 3.12.10
+# was incorrectly reported as failing the version check.
 # ============================================================
 
 function Test-PythonVersionOk {
 
     param(
-        [string[]]$Command
+        [Parameter(Mandatory = $true)]
+        [string]$PythonExe
     )
 
 
-    if (-not $Command -or $Command.Count -eq 0) {
+    if (-not $PythonExe) {
 
         return $false
     }
 
 
-    $exe = $Command[0]
-
-
-    if (
-        $exe -match '[\\/]' -and
-        -not (Test-Path -LiteralPath $exe)
-    ) {
-
-        return $false
-    }
-
-
-    # Ignore Microsoft Store Python stub.
-    if (
-        $exe -match '\\WindowsApps\\python(\.exe)?$'
-    ) {
+    if (-not (Test-Path -LiteralPath $PythonExe)) {
 
         return $false
     }
@@ -765,28 +673,41 @@ function Test-PythonVersionOk {
 
     try {
 
-        $oldEap = $ErrorActionPreference
-
-        $ErrorActionPreference = "Continue"
+        $versionOutput = & $PythonExe --version 2>&1
 
 
-        Invoke-PythonCmd `
-            $Command `
-            -c `
-            "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" `
-            2>$null |
-            Out-Null
+        if (-not $versionOutput) {
+
+            return $false
+        }
 
 
-        $ok = (
-            $LASTEXITCODE -eq 0
-        )
+        $versionText = $versionOutput.ToString().Trim()
 
 
-        $ErrorActionPreference = $oldEap
+        if (
+            $versionText -match `
+            '^Python\s+(\d+)\.(\d+)\.(\d+)'
+        ) {
+
+            $major = [int]$Matches[1]
+            $minor = [int]$Matches[2]
 
 
-        return $ok
+            if (
+                ($major -gt 3) -or
+                (
+                    ($major -eq 3) -and
+                    ($minor -ge 10)
+                )
+            ) {
+
+                return $true
+            }
+        }
+
+
+        return $false
     }
     catch {
 
@@ -796,39 +717,7 @@ function Test-PythonVersionOk {
 
 
 # ============================================================
-# Python installation paths
-# ============================================================
-
-function Get-PythonInstallPaths {
-
-    $globs = @(
-        "$env:LocalAppData\Programs\Python\Python3*\python.exe",
-        "$env:ProgramFiles\Python3*\python.exe",
-        "${env:ProgramFiles(x86)}\Python3*\python.exe"
-    )
-
-
-    $found = @()
-
-
-    foreach ($g in $globs) {
-
-        $found += @(
-            Get-Item `
-                -Path $g `
-                -ErrorAction SilentlyContinue |
-            Select-Object `
-                -ExpandProperty FullName
-        )
-    }
-
-
-    return $found
-}
-
-
-# ============================================================
-# Find existing Python
+# Find installed Python
 # ============================================================
 
 function Find-PythonCommand {
@@ -836,102 +725,171 @@ function Find-PythonCommand {
     Refresh-SessionPath
 
 
-    # --------------------------------------------------------
-    # 1. Standard Python paths
-    # --------------------------------------------------------
+    # ========================================================
+    # 1. EXACT location of your current Python installation
+    # ========================================================
 
-    foreach ($path in (Get-PythonInstallPaths)) {
+    $knownPaths = @(
+        "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
+        "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
+        "$env:LOCALAPPDATA\Programs\Python\Python310\python.exe"
+    )
+
+
+    foreach ($path in $knownPaths) {
 
         if (
-            Test-PythonVersionOk @($path)
+            Test-PythonVersionOk `
+                -PythonExe $path
         ) {
 
-            return @($path)
+            return $path
         }
     }
 
 
-    # --------------------------------------------------------
-    # 2. Python launcher
-    # --------------------------------------------------------
+    # ========================================================
+    # 2. Search normal Python installation directories
+    # ========================================================
+
+    $patterns = @(
+        "$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe",
+        "$env:ProgramFiles\Python3*\python.exe",
+        "${env:ProgramFiles(x86)}\Python3*\python.exe"
+    )
+
+
+    foreach ($pattern in $patterns) {
+
+        $matches = @(
+            Get-Item `
+                -Path $pattern `
+                -ErrorAction SilentlyContinue
+        )
+
+
+        foreach ($item in $matches) {
+
+            if (
+                Test-PythonVersionOk `
+                    -PythonExe $item.FullName
+            ) {
+
+                return $item.FullName
+            }
+        }
+    }
+
+
+    # ========================================================
+    # 3. python.exe on PATH
+    # ========================================================
+
+    try {
+
+        $cmd = Get-Command `
+            python.exe `
+            -ErrorAction Stop
+
+
+        $path = $cmd.Source
+
+
+        # Ignore Microsoft Store stub.
+        if (
+            $path -and
+            ($path -notmatch '\\WindowsApps\\')
+        ) {
+
+            if (
+                Test-PythonVersionOk `
+                    -PythonExe $path
+            ) {
+
+                return $path
+            }
+        }
+    }
+    catch {
+    }
+
+
+    # ========================================================
+    # 4. python3.exe on PATH
+    # ========================================================
+
+    try {
+
+        $cmd = Get-Command `
+            python3.exe `
+            -ErrorAction Stop
+
+
+        $path = $cmd.Source
+
+
+        if (
+            $path -and
+            ($path -notmatch '\\WindowsApps\\')
+        ) {
+
+            if (
+                Test-PythonVersionOk `
+                    -PythonExe $path
+            ) {
+
+                return $path
+            }
+        }
+    }
+    catch {
+    }
+
+
+    # ========================================================
+    # 5. py.exe launcher
+    #
+    # We only use it as a fallback.
+    # ========================================================
 
     try {
 
         $py = Get-Command `
-            py `
+            py.exe `
             -ErrorAction Stop
 
 
-        if (
-            Test-PythonVersionOk @(
-                $py.Source,
-                "-3"
-            )
-        ) {
-
-            return @(
-                $py.Source,
-                "-3"
-            )
-        }
-    }
-    catch { }
-
-
-    # --------------------------------------------------------
-    # 3. python
-    # --------------------------------------------------------
-
-    try {
-
-        $cmd = Get-Command `
-            python `
-            -ErrorAction Stop
+        $output = & $py.Source -3 --version 2>&1
 
 
         if (
-            $cmd.Source -notmatch '\\WindowsApps\\' -and
-            (
-                Test-PythonVersionOk @(
-                    $cmd.Source
-                )
-            )
+            $output -match `
+            '^Python\s+3\.(\d+)\.'
         ) {
 
-            return @(
-                $cmd.Source
-            )
+            $minor = [int]$Matches[1]
+
+
+            if ($minor -ge 10) {
+
+                # Find the real python executable used by py.
+                $realPython = & $py.Source -3 -c `
+                    "import sys; print(sys.executable)" `
+                    2>$null
+
+
+                if (
+                    $realPython -and
+                    (Test-Path -LiteralPath $realPython)
+                ) {
+
+                    return $realPython.Trim()
+                }
+            }
         }
     }
-    catch { }
-
-
-    # --------------------------------------------------------
-    # 4. python3
-    # --------------------------------------------------------
-
-    try {
-
-        $cmd = Get-Command `
-            python3 `
-            -ErrorAction Stop
-
-
-        if (
-            $cmd.Source -notmatch '\\WindowsApps\\' -and
-            (
-                Test-PythonVersionOk @(
-                    $cmd.Source
-                )
-            )
-        ) {
-
-            return @(
-                $cmd.Source
-            )
-        }
+    catch {
     }
-    catch { }
 
 
     return $null
@@ -960,7 +918,7 @@ function Get-PythonArchSuffix {
 # ============================================================
 # Install Python
 #
-# Direct download uses curl.exe.
+# Uses curl.exe.
 # ============================================================
 
 function Install-PythonViaOfficialInstaller {
@@ -990,7 +948,7 @@ function Install-PythonViaOfficialInstaller {
 
 
     # ========================================================
-    # Python download via curl
+    # Python download through curl
     # ========================================================
 
     $downloaded = Download-With-Curl `
@@ -1000,9 +958,6 @@ function Install-PythonViaOfficialInstaller {
 
 
     if (-not $downloaded) {
-
-        Write-Warn `
-            "Python download failed."
 
         return $false
     }
@@ -1051,23 +1006,32 @@ function Install-PythonViaOfficialInstaller {
         Refresh-SessionPath
 
 
-        # 3010 = installed successfully but reboot required.
+        # 0 = success
+        # 3010 = success, reboot required
+
         if (
-            (
-                $p.ExitCode -eq 0 -or
-                $p.ExitCode -eq 3010
-            ) -and
-            (Find-PythonCommand)
+            $p.ExitCode -eq 0 -or
+            $p.ExitCode -eq 3010
         ) {
 
-            if ($p.ExitCode -eq 3010) {
+            # Give Windows a moment to update files/PATH.
+            Start-Sleep -Seconds 2
 
-                Write-Warn `
-                    "Python installed but Windows wants a reboot to finish."
+
+            $found = Find-PythonCommand
+
+
+            if ($found) {
+
+                if ($p.ExitCode -eq 3010) {
+
+                    Write-Warn `
+                        "Python installed but Windows requested a reboot."
+                }
+
+
+                return $true
             }
-
-
-            return $true
         }
 
 
@@ -1098,21 +1062,27 @@ function Install-PythonViaOfficialInstaller {
 
 
         if (
-            (
-                $p.ExitCode -eq 0 -or
-                $p.ExitCode -eq 3010
-            ) -and
-            (Find-PythonCommand)
+            $p.ExitCode -eq 0 -or
+            $p.ExitCode -eq 3010
         ) {
 
-            if ($p.ExitCode -eq 3010) {
+            Start-Sleep -Seconds 2
 
-                Write-Warn `
-                    "Python installed but Windows wants a reboot to finish."
+
+            $found = Find-PythonCommand
+
+
+            if ($found) {
+
+                if ($p.ExitCode -eq 3010) {
+
+                    Write-Warn `
+                        "Python installed but Windows requested a reboot."
+                }
+
+
+                return $true
             }
-
-
-            return $true
         }
 
 
@@ -1120,53 +1090,17 @@ function Install-PythonViaOfficialInstaller {
             "Installer exit code: $($p.ExitCode)"
 
 
-        if ($p.ExitCode -eq 1601) {
-
-            Write-Err `
-                "Windows Installer service is unavailable on this PC (error 1601)."
-
-
-            Write-Host ""
-            Write-Host `
-                "This is a Windows problem, not this script."
-
-
-            Write-Host ""
-            Write-Host `
-                "Fix as Administrator:"
-
-
-            Write-Host `
-                "    sc config msiserver start= demand"
-
-
-            Write-Host `
-                "    sc start msiserver"
-
-
-            Write-Host ""
-
-
-            Write-Host `
-                "If that doesn't work:"
-
-
-            Write-Host `
-                "    msiexec.exe /unregister"
-
-
-            Write-Host `
-                "    msiexec.exe /regserver"
-
-
-            Write-Host ""
-        }
-
-
         if ($p.ExitCode -eq 1603) {
 
             Write-Warn `
                 "Python installer returned error 1603."
+
+
+            Write-Host ""
+            Write-Host `
+                "This can occur when an existing Python installation conflicts"
+            Write-Host `
+                "with the requested installation or Windows installer state."
         }
 
 
@@ -1176,6 +1110,7 @@ function Install-PythonViaOfficialInstaller {
 
         Write-Warn `
             "Official Python installer failed: $_"
+
 
         return $false
     }
@@ -1195,53 +1130,49 @@ function Install-PythonViaOfficialInstaller {
 
 function Ensure-Python {
 
-    # IMPORTANT:
-    # Existing Python is checked FIRST.
-    #
-    # If Python 3.10+ exists, nothing is downloaded.
-    # ========================================================
-
     Write-Info `
         "Checking for an existing Python installation..."
 
+
+    # ========================================================
+    # IMPORTANT:
+    # Existing Python is checked BEFORE any download.
+    # ========================================================
 
     $found = Find-PythonCommand
 
 
     if ($found) {
 
-        $label = (
-            $found -join " "
-        )
-
-
         Write-Host `
-            "    Detected Python: $label" `
-            -ForegroundColor DarkGray
+            "    Detected Python: $found"
 
 
         Write-Ok `
-            "Python found: $label"
+            "Python found: $found"
 
 
         try {
 
-            $ver = Invoke-PythonCmd `
-                $found `
-                --version `
-                2>&1
+            $version = & $found --version 2>&1
 
 
-            if ($ver) {
+            if ($version) {
 
-                Write-Ok "$ver"
+                Write-Ok `
+                    "$version"
             }
         }
-        catch { }
+        catch {
+        }
 
 
-        # CRITICAL:
-        # Do not download Python again.
+        # ====================================================
+        # STOP HERE.
+        #
+        # Python will NOT be downloaded again.
+        # ====================================================
+
         return
     }
 
@@ -1254,33 +1185,24 @@ function Ensure-Python {
         "Python 3.10+ was not found. Installing automatically..."
 
 
-    $ok = $false
+    $ok = Install-PythonViaOfficialInstaller
 
 
-    if (
-        Install-PythonViaOfficialInstaller
-    ) {
+    if ($ok) {
 
-        $ok = $true
+        Refresh-SessionPath
 
 
-        Write-Ok `
-            "Python installed via official installer."
-    }
+        $found = Find-PythonCommand
 
 
-    Refresh-SessionPath
+        if ($found) {
 
+            Write-Ok `
+                "Python is ready: $found"
 
-    $found = Find-PythonCommand
-
-
-    if ($found) {
-
-        Write-Ok `
-            "Python is ready: $($found -join ' ')"
-
-        return
+            return
+        }
     }
 
 
@@ -1305,7 +1227,7 @@ function Ensure-Python {
 
 
     foreach ($g in @(
-        "$env:LocalAppData\Programs\Python\Python3*\python.exe",
+        "$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe",
         "$env:ProgramFiles\Python3*\python.exe",
         "${env:ProgramFiles(x86)}\Python3*\python.exe"
     )) {
@@ -1334,17 +1256,28 @@ function Ensure-Python {
                     "    -> found: $($m.FullName)"
 
 
-                Write-Host `
-                    "       version check passed: $(Test-PythonVersionOk @($m.FullName))"
+                try {
+
+                    $v = & $m.FullName --version 2>&1
+
+
+                    Write-Host `
+                        "       $v"
+                }
+                catch {
+                }
             }
         }
     }
 
 
+    Write-Host ""
+
+
     foreach ($cmdName in @(
-        "py",
         "python",
-        "python3"
+        "python3",
+        "py"
     )) {
 
         try {
@@ -1440,11 +1373,19 @@ function Ensure-Venv {
     $py = Get-PythonCmd
 
 
-    Invoke-PythonCmd `
-        $py `
+    & $py `
         -m `
         venv `
         .venv
+
+
+    if ($LASTEXITCODE -ne 0) {
+
+        Write-Err `
+            "Failed to create .venv."
+
+        exit 1
+    }
 
 
     if (
@@ -1455,7 +1396,7 @@ function Ensure-Venv {
     ) {
 
         Write-Err `
-            "Failed to create .venv"
+            "Failed to create .venv."
 
         exit 1
     }
@@ -1467,9 +1408,9 @@ function Ensure-Venv {
 
 
 # ============================================================
-# Python dependencies
+# Dependencies
 #
-# pip manages these downloads.
+# pip handles Python packages.
 # ============================================================
 
 function Ensure-Dependencies {
@@ -1516,7 +1457,7 @@ function Ensure-Dependencies {
 
 
 # ============================================================
-# Read environment variable with default
+# Read environment value
 # ============================================================
 
 function Read-EnvDefault(
@@ -1928,7 +1869,7 @@ else {
 
 
 # ============================================================
-# Check Chrome every time
+# Verify Chrome every time
 # ============================================================
 
 if (
