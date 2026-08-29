@@ -5,6 +5,9 @@ cd /d "%~dp0"
 
 REM ============================================================
 REM WTR-Lab Local Worker
+REM Chrome install uses the official Enterprise MSI (reliable in
+REM Windows Sandbox / WDAGUtilityAccount). The consumer EXE
+REM installer often returns 0 without actually installing.
 REM ============================================================
 
 set "WTR_PROJECT_ROOT=%CD%"
@@ -65,7 +68,9 @@ $Marker     = Join-Path $ProjectRoot "data\.setup_done"
 
 $GithubZipUrl = "https://github.com/patrick-mulinge/WTR-Lab-crawler/archive/refs/heads/main.zip"
 
-$ChromeUrl = "https://dl.google.com/chrome/install/ChromeStandaloneSetup64.exe"
+# Official 64-bit Enterprise MSI. The consumer ChromeStandaloneSetup64.exe
+# often exits 0 in Windows Sandbox without writing chrome.exe.
+$ChromeMsiUrl = "https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi"
 
 $PythonVersion = "3.12.10"
 
@@ -288,10 +293,6 @@ function Ensure-ProjectFiles {
 
     try {
 
-        # ====================================================
-        # GitHub ZIP uses curl.exe
-        # ====================================================
-
         $ok = Download-With-Curl `
             -Url $GithubZipUrl `
             -OutputFile $tmpZip `
@@ -395,20 +396,87 @@ function Ensure-ProjectFiles {
 # Chrome detection
 # ============================================================
 
-function Test-ChromeInstalled {
+function Get-ChromeExePath {
 
-    $paths = @(
+    $candidates = @(
         "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe",
         "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
         "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
     )
 
 
-    foreach ($p in $paths) {
+    foreach ($p in $candidates) {
 
         if (Test-Path -LiteralPath $p) {
 
-            return $true
+            return $p
+        }
+    }
+
+
+    $regKeys = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"
+    )
+
+
+    foreach ($key in $regKeys) {
+
+        try {
+
+            $item = Get-ItemProperty `
+                -LiteralPath $key `
+                -ErrorAction Stop
+
+
+            if ($item.'(default)' -and (Test-Path -LiteralPath $item.'(default)')) {
+
+                return $item.'(default)'
+            }
+
+
+            if ($item.Path) {
+
+                $joined = Join-Path $item.Path "chrome.exe"
+
+                if (Test-Path -LiteralPath $joined) {
+
+                    return $joined
+                }
+            }
+        }
+        catch {
+        }
+    }
+
+
+    $searchRoots = @(
+        "${env:ProgramFiles}\Google\Chrome",
+        "${env:ProgramFiles(x86)}\Google\Chrome",
+        "$env:LOCALAPPDATA\Google\Chrome"
+    )
+
+
+    foreach ($root in $searchRoots) {
+
+        if (-not (Test-Path -LiteralPath $root)) {
+
+            continue
+        }
+
+
+        $found = Get-ChildItem `
+            -LiteralPath $root `
+            -Recurse `
+            -Filter "chrome.exe" `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
+
+        if ($found) {
+
+            return $found.FullName
         }
     }
 
@@ -420,44 +488,58 @@ function Test-ChromeInstalled {
             -ErrorAction Stop
 
 
-        if ($chrome.Source) {
+        if (
+            $chrome.Source -and
+            (Test-Path -LiteralPath $chrome.Source)
+        ) {
 
-            return $true
+            return $chrome.Source
         }
     }
     catch {
     }
 
 
-    return $false
+    return $null
+}
+
+
+function Test-ChromeInstalled {
+
+    $path = Get-ChromeExePath
+
+    return [bool]$path
 }
 
 
 # ============================================================
-# Install Chrome
+# Install Chrome via official Enterprise MSI
 #
-# Uses curl.exe.
+# Uses curl.exe + msiexec.
 # Does NOT use winget.
-# Does NOT use Invoke-WebRequest.
+# Does NOT use the consumer ChromeStandaloneSetup64.exe
+# (that installer often reports success without installing
+# in Windows Sandbox).
 # ============================================================
 
 function Install-Chrome {
 
-    $ChromeInstaller = Join-Path `
+    $ChromeMsi = Join-Path `
         $env:TEMP `
-        "ChromeStandaloneSetup64.exe"
+        "googlechromestandaloneenterprise64.msi"
 
 
-    Write-Info "Downloading official Google Chrome installer..."
+    Write-Info "Downloading official Google Chrome Enterprise MSI..."
 
-    Write-Host "    The installer is approximately 155 MB."
+    Write-Host "    The installer is approximately 160 MB."
+    Write-Host "    This method works in Windows Sandbox."
     Write-Host ""
 
 
     $ok = Download-With-Curl `
-        -Url $ChromeUrl `
-        -OutputFile $ChromeInstaller `
-        -Description "Google Chrome installer"
+        -Url $ChromeMsiUrl `
+        -OutputFile $ChromeMsi `
+        -Description "Google Chrome MSI"
 
 
     if (-not $ok) {
@@ -473,31 +555,51 @@ function Install-Chrome {
     }
 
 
-    # ========================================================
-    # Install Chrome
-    # ========================================================
-
-    Write-Info "Installing Google Chrome..."
+    Write-Info "Installing Google Chrome (silent MSI)..."
 
 
     try {
 
+        $log = Join-Path $env:TEMP "wtrlab-chrome-install.log"
+
         $process = Start-Process `
-            -FilePath $ChromeInstaller `
-            -ArgumentList "/silent", "/install" `
+            -FilePath "msiexec.exe" `
+            -ArgumentList @(
+                "/i",
+                "`"$ChromeMsi`"",
+                "/qn",
+                "/norestart",
+                "/l*v",
+                "`"$log`""
+            ) `
             -Wait `
             -PassThru
 
 
         Write-Host `
-            "    Chrome installer exit code: $($process.ExitCode)"
+            "    Chrome MSI exit code: $($process.ExitCode)"
+
+
+        # 0 = success, 3010 = success reboot required
+        if (
+            $process.ExitCode -ne 0 -and
+            $process.ExitCode -ne 3010
+        ) {
+
+            Write-Warn "MSI returned a non-success code."
+
+            if (Test-Path -LiteralPath $log) {
+
+                Write-Host "    Log: $log"
+            }
+        }
     }
     catch {
 
         Write-Err "Chrome installation failed: $_"
 
         Remove-Item `
-            -LiteralPath $ChromeInstaller `
+            -LiteralPath $ChromeMsi `
             -Force `
             -ErrorAction SilentlyContinue
 
@@ -505,47 +607,31 @@ function Install-Chrome {
     }
 
 
-    Start-Sleep `
-        -Seconds 5
+    # MSI can finish before chrome.exe is fully visible.
+    $attempts = @(3, 5, 8, 10)
 
+    foreach ($wait in $attempts) {
 
-    Refresh-SessionPath
+        Start-Sleep -Seconds $wait
 
+        Refresh-SessionPath
 
-    if (Test-ChromeInstalled) {
+        if (Test-ChromeInstalled) {
 
-        Write-Ok "Chrome installed successfully."
+            $exe = Get-ChromeExePath
 
-        Remove-Item `
-            -LiteralPath $ChromeInstaller `
-            -Force `
-            -ErrorAction SilentlyContinue
+            Write-Ok "Chrome installed successfully."
+            Write-Host "    $exe"
 
-        return
-    }
+            Remove-Item `
+                -LiteralPath $ChromeMsi `
+                -Force `
+                -ErrorAction SilentlyContinue
 
+            return
+        }
 
-    Write-Warn `
-        "Chrome installer finished but Chrome was not detected immediately."
-
-
-    Start-Sleep `
-        -Seconds 5
-
-
-    Refresh-SessionPath
-
-
-    if (Test-ChromeInstalled) {
-
-        Write-Ok "Chrome installed successfully."
-
-        Remove-Item `
-            -LiteralPath $ChromeInstaller `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-        return
+        Write-Info "Waiting for chrome.exe to appear..."
     }
 
 
@@ -555,10 +641,13 @@ function Install-Chrome {
     Write-Host "Install Chrome manually from:"
     Write-Host "https://www.google.com/chrome/"
     Write-Host ""
+    Write-Host "Or run this in PowerShell, then re-run this script:"
+    Write-Host '  msiexec /i "%TEMP%\googlechromestandaloneenterprise64.msi" /qn /norestart'
+    Write-Host ""
 
 
     Remove-Item `
-        -LiteralPath $ChromeInstaller `
+        -LiteralPath $ChromeMsi `
         -Force `
         -ErrorAction SilentlyContinue
 
@@ -575,7 +664,10 @@ function Ensure-Chrome {
 
     if (Test-ChromeInstalled) {
 
+        $exe = Get-ChromeExePath
+
         Write-Ok "Google Chrome found."
+        Write-Host "    $exe"
 
         return
     }
@@ -725,10 +817,6 @@ function Find-PythonCommand {
     Refresh-SessionPath
 
 
-    # ========================================================
-    # 1. EXACT location of your current Python installation
-    # ========================================================
-
     $knownPaths = @(
         "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
         "$env:LOCALAPPDATA\Programs\Python\Python311\python.exe",
@@ -747,10 +835,6 @@ function Find-PythonCommand {
         }
     }
 
-
-    # ========================================================
-    # 2. Search normal Python installation directories
-    # ========================================================
 
     $patterns = @(
         "$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe",
@@ -781,10 +865,6 @@ function Find-PythonCommand {
     }
 
 
-    # ========================================================
-    # 3. python.exe on PATH
-    # ========================================================
-
     try {
 
         $cmd = Get-Command `
@@ -795,7 +875,6 @@ function Find-PythonCommand {
         $path = $cmd.Source
 
 
-        # Ignore Microsoft Store stub.
         if (
             $path -and
             ($path -notmatch '\\WindowsApps\\')
@@ -813,10 +892,6 @@ function Find-PythonCommand {
     catch {
     }
 
-
-    # ========================================================
-    # 4. python3.exe on PATH
-    # ========================================================
 
     try {
 
@@ -846,12 +921,6 @@ function Find-PythonCommand {
     }
 
 
-    # ========================================================
-    # 5. py.exe launcher
-    #
-    # We only use it as a fallback.
-    # ========================================================
-
     try {
 
         $py = Get-Command `
@@ -872,7 +941,6 @@ function Find-PythonCommand {
 
             if ($minor -ge 10) {
 
-                # Find the real python executable used by py.
                 $realPython = & $py.Source -3 -c `
                     "import sys; print(sys.executable)" `
                     2>$null
@@ -947,10 +1015,6 @@ function Install-PythonViaOfficialInstaller {
         "    $url"
 
 
-    # ========================================================
-    # Python download through curl
-    # ========================================================
-
     $downloaded = Download-With-Curl `
         -Url $url `
         -OutputFile $tmp `
@@ -962,10 +1026,6 @@ function Install-PythonViaOfficialInstaller {
         return $false
     }
 
-
-    # ========================================================
-    # Run installer
-    # ========================================================
 
     Write-Info `
         "Running silent Python installer (Add to PATH, pip, py launcher)..."
@@ -988,10 +1048,6 @@ function Install-PythonViaOfficialInstaller {
 
     try {
 
-        # ----------------------------------------------------
-        # Per-user installation
-        # ----------------------------------------------------
-
         $p = Start-Process `
             -FilePath $tmp `
             -ArgumentList (
@@ -1006,15 +1062,11 @@ function Install-PythonViaOfficialInstaller {
         Refresh-SessionPath
 
 
-        # 0 = success
-        # 3010 = success, reboot required
-
         if (
             $p.ExitCode -eq 0 -or
             $p.ExitCode -eq 3010
         ) {
 
-            # Give Windows a moment to update files/PATH.
             Start-Sleep -Seconds 2
 
 
@@ -1034,10 +1086,6 @@ function Install-PythonViaOfficialInstaller {
             }
         }
 
-
-        # ----------------------------------------------------
-        # All-users installation
-        # ----------------------------------------------------
 
         Write-Warn `
             "Per-user install did not register Python."
@@ -1134,11 +1182,6 @@ function Ensure-Python {
         "Checking for an existing Python installation..."
 
 
-    # ========================================================
-    # IMPORTANT:
-    # Existing Python is checked BEFORE any download.
-    # ========================================================
-
     $found = Find-PythonCommand
 
 
@@ -1167,19 +1210,9 @@ function Ensure-Python {
         }
 
 
-        # ====================================================
-        # STOP HERE.
-        #
-        # Python will NOT be downloaded again.
-        # ====================================================
-
         return
     }
 
-
-    # ========================================================
-    # Python genuinely missing
-    # ========================================================
 
     Write-Warn `
         "Python 3.10+ was not found. Installing automatically..."
@@ -1205,10 +1238,6 @@ function Ensure-Python {
         }
     }
 
-
-    # ========================================================
-    # Diagnostics
-    # ========================================================
 
     Write-Err `
         "Automatic Python install did not finish."
@@ -1409,8 +1438,6 @@ function Ensure-Venv {
 
 # ============================================================
 # Dependencies
-#
-# pip handles Python packages.
 # ============================================================
 
 function Ensure-Dependencies {
@@ -1792,18 +1819,10 @@ Write-Host `
 Write-Host ""
 
 
-# ============================================================
-# Project
-# ============================================================
-
 Ensure-ProjectFiles
 
 Ensure-DataDir
 
-
-# ============================================================
-# Setup detection
-# ============================================================
 
 $needsSetup = -not (
     Test-SetupDone
@@ -1816,44 +1835,15 @@ if ($needsSetup) {
         "First-time (or incomplete) setup..."
 
 
-    # --------------------------------------------------------
-    # Python
-    # --------------------------------------------------------
-
     Ensure-Python
-
-
-    # --------------------------------------------------------
-    # Chrome
-    # --------------------------------------------------------
 
     Ensure-Chrome
 
-
-    # --------------------------------------------------------
-    # Virtual environment
-    # --------------------------------------------------------
-
     Ensure-Venv
-
-
-    # --------------------------------------------------------
-    # Dependencies
-    # --------------------------------------------------------
 
     Ensure-Dependencies
 
-
-    # --------------------------------------------------------
-    # .env
-    # --------------------------------------------------------
-
     Ensure-EnvFile
-
-
-    # --------------------------------------------------------
-    # Mark setup complete
-    # --------------------------------------------------------
 
     Mark-SetupDone
 
@@ -1867,10 +1857,6 @@ else {
         "Setup already done - starting worker."
 }
 
-
-# ============================================================
-# Verify Chrome every time
-# ============================================================
 
 if (
     -not (
@@ -1886,16 +1872,8 @@ if (
 }
 
 
-# ============================================================
-# Chrome processes
-# ============================================================
-
 Stop-ChromeIfNeeded
 
-
-# ============================================================
-# Start worker
-# ============================================================
 
 Write-Host ""
 
@@ -1918,10 +1896,6 @@ Write-Host `
 
 Write-Host ""
 
-
-# ============================================================
-# Run worker
-# ============================================================
 
 & $VenvPython `
     $AppFile
