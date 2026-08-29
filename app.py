@@ -382,6 +382,17 @@ def setup_local_db():
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS chapter_pulls (
+                user_id INTEGER NOT NULL,
+                novel_id TEXT NOT NULL,
+                chapter_no INTEGER NOT NULL,
+                pulled_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (user_id, novel_id, chapter_no)
+            );
+
+            CREATE INDEX IF NOT EXISTS chapter_pulls_user_novel_time_idx
+                ON chapter_pulls (user_id, novel_id, pulled_at);
             """
         )
         conn.execute(
@@ -394,13 +405,36 @@ def setup_local_db():
                 conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT")
             except sqlite3.OperationalError:
                 pass  # column already exists
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chapter_pulls (
+                    user_id INTEGER NOT NULL,
+                    novel_id TEXT NOT NULL,
+                    chapter_no INTEGER NOT NULL,
+                    pulled_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (user_id, novel_id, chapter_no)
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS chapter_pulls_user_novel_time_idx
+                    ON chapter_pulls (user_id, novel_id, pulled_at);
+                """
+            )
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
     finally:
         conn.close()
 
 
 def get_chapter_cap() -> int:
-    """Return max chapter span, or 0 for unlimited."""
+    """
+    Max first-time network chapter fetches per user per novel per 24h
+    (CHAPTER_CAP in .env). 0 = unlimited. Cache hits do not count.
+    """
     conn = local_db()
     try:
         row = conn.execute(
@@ -416,28 +450,76 @@ def get_chapter_cap() -> int:
 
 
 def apply_range_cap(chapter_range: str, unlimited: bool = False) -> str:
-    """Clamp range only when a positive CHAPTER_CAP is configured."""
-    if unlimited:
-        return chapter_range
+    """
+    Ranges are no longer shrunk to 1..CHAPTER_CAP.
+    CHAPTER_CAP limits daily network fetches during download instead.
+    """
+    text = (chapter_range or "all").strip()
+    return text or "all"
+
+
+def count_chapter_pulls(
+    user_id: int, novel_id: str, hours: int = 24
+) -> int:
+    """How many first-time network chapter fetches this user did for novel."""
+    conn = local_db()
+    try:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM chapter_pulls
+            WHERE user_id = ?
+              AND novel_id = ?
+              AND pulled_at >= datetime('now', ?)
+            """,
+            (int(user_id), str(novel_id), f"-{int(hours)} hours"),
+        ).fetchone()
+        return int(row["c"] if row else 0)
+    except Exception as error:
+        print(f"[PULL COUNT ERROR] {error}")
+        return 0
+    finally:
+        conn.close()
+
+
+def register_chapter_pull(
+    user_id: int, novel_id: str, chapter_no: int
+) -> bool:
+    """
+    Record a first-time network fetch. Returns True if this row is new
+    (counts against CHAPTER_CAP). Re-downloads of the same chapter do not
+    insert again and do not count.
+    """
+    conn = local_db()
+    try:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO chapter_pulls
+                (user_id, novel_id, chapter_no, pulled_at)
+            VALUES (?, ?, ?, datetime('now'))
+            """,
+            (int(user_id), str(novel_id), int(chapter_no)),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    except Exception as error:
+        print(f"[PULL REGISTER ERROR] {error}")
+        return False
+    finally:
+        conn.close()
+
+
+def pulls_remaining(user_id: int, novel_id: str, unlimited: bool = False) -> int:
+    """
+    Remaining first-time network fetches for this user/novel in 24h.
+    Large number means unlimited (admin or CHAPTER_CAP=0).
+    """
+    if unlimited or is_admin(user_id):
+        return 10**9
     cap = get_chapter_cap()
     if cap <= 0:
-        return chapter_range  # unlimited
-    text = (chapter_range or "all").strip().lower()
-    if text in ("", "all", "full"):
-        return f"1 {cap}"
-    numbers = [int(n) for n in re.findall(r"\d+", text)]
-    if len(numbers) == 1:
-        start = end = numbers[0]
-    elif len(numbers) >= 2:
-        start, end = numbers[0], numbers[1]
-    else:
-        return chapter_range
-    start = max(1, start)
-    if end < start:
-        end = start
-    if end - start + 1 > cap:
-        end = start + cap - 1
-    return f"{start} {end}"
+        return 10**9
+    used = count_chapter_pulls(user_id, novel_id, hours=24)
+    return max(0, cap - used)
 
 
 def normalize_novel_url(url: str) -> str:
@@ -530,11 +612,11 @@ def insert_task(
         used = count_recent_tasks(user_id)
         if used >= DAILY_TASK_LIMIT:
             return None, (
-                f"Daily limit reached ({DAILY_TASK_LIMIT} task(s) / 24h).\n"
+                f"Daily task limit reached ({DAILY_TASK_LIMIT} / 24h).\n"
                 "A different novel is blocked while that slot is used.\n"
                 "• Resend the same failed/partial link to resume from cache, or\n"
                 "• Use /continue to re-queue your latest failed task.\n"
-                "New novels must wait until the 24h window resets."
+                "Contact admin if you need help or another task."
             )
 
     chapter_range = apply_range_cap(chapter_range, unlimited=unlimited_cap)
@@ -3381,9 +3463,11 @@ def process_task(task: dict, browser: WtrBrowser):
                 f"AI-Unlock progress is {unlocked_cap}/{total_listed}."
             )
 
-        # Only fetch chapters that are missing/empty. Gaps (e.g. ch 200 + 387
-        # bad while 201–386 are fine) must NOT re-download everything after the
-        # first hole — that was overwriting good cache.
+        user_id = int(task["user_id"])
+        unlimited_pulls = is_admin(user_id)
+        daily_cap = get_chapter_cap()
+
+        # Only fetch chapters that are missing/empty (gap-only).
         to_fetch = [
             ch
             for ch in requested
@@ -3393,6 +3477,8 @@ def process_task(task: dict, browser: WtrBrowser):
         completed = cached_count
         last_progress = 0.0
         last_chapter_request = 0.0
+        stopped_by_pull_cap = False
+        network_fetches_this_run = 0
 
         unlock_line = (
             f"🔓 AI-Unlock: {unlocked_cap}/{total_listed} · {novel.status_label}"
@@ -3404,16 +3490,16 @@ def process_task(task: dict, browser: WtrBrowser):
             print(
                 f"[RESUME] novel={novel.novel_id} "
                 f"cached={cached_count}/{len(requested)} "
-                f"missing={len(to_fetch)} {sample}{more}"
+                f"missing={len(to_fetch)} {sample}{more} "
+                f"pulls_left={pulls_remaining(user_id, novel.novel_id, unlimited_pulls)}"
             )
             edit_progress(
                 progress,
                 (
                     f"📖 {novel.title}\n\n"
                     f"📥 Resuming local WTR-Lab worker...\n\n"
-                    f"📌 Cached already: {cached_count}/{len(requested)}\n"
-                    f"▶️ To download: {len(to_fetch)} chapter(s) "
-                    f"(only gaps / empty files)\n"
+                    f"📌 Already on server: {cached_count}/{len(requested)}\n"
+                    f"▶️ Need from site: {len(to_fetch)} chapter(s)\n"
                     f"🔍 Range: from {start} to {end}\n"
                     f"{unlock_line}"
                 ),
@@ -3427,7 +3513,8 @@ def process_task(task: dict, browser: WtrBrowser):
                 progress,
                 (
                     f"📖 {novel.title}\n\n"
-                    f"📥 All chapters cached — preparing EPUB...\n\n"
+                    f"📥 All needed chapters are already on the server — "
+                    f"preparing EPUB...\n\n"
                     f"🔍 Range: from {start} to {end}\n"
                     f"{unlock_line}"
                 ),
@@ -3437,8 +3524,16 @@ def process_task(task: dict, browser: WtrBrowser):
             if is_cancelled(task_id):
                 raise TaskCancelled()
 
+            # CHAPTER_CAP = daily first-time network fetches per user/novel.
+            if pulls_remaining(user_id, novel.novel_id, unlimited_pulls) <= 0:
+                stopped_by_pull_cap = True
+                print(
+                    f"[PULL CAP] user={user_id} novel={novel.novel_id} "
+                    f"cap={daily_cap} — stopping network fetches at ch {chapter.order}"
+                )
+                break
+
             xhtml_path = novel_dir / "chapters" / f"{chapter.order:05}.xhtml"
-            # Drop any empty/corrupt file before rewrite.
             if xhtml_path.is_file() and chapter_cache_is_bad(xhtml_path):
                 purge_chapter_cache(novel.novel_id, chapter.order, xhtml_path)
 
@@ -3459,8 +3554,6 @@ def process_task(task: dict, browser: WtrBrowser):
             except ChapterLocked:
                 last_ok = chapter.order - 1
                 if completed > 0 and last_ok >= start:
-                    # Partial → failed (not done) so same-link resume stays free
-                    # and a different novel still hits the daily limit.
                     send_partial_if_possible(
                         (
                             f"🔓 Stopped at chapter {chapter.order}: it is still "
@@ -3468,8 +3561,7 @@ def process_task(task: dict, browser: WtrBrowser):
                             f"Sending unlocked chapters {start}–{last_ok} "
                             f"({unlocked_cap}/{total_listed} unlocked).\n\n"
                             "📌 Resend the same link (or /continue) to resume "
-                            "from cache. A different novel is blocked until "
-                            "this slot frees or 24h pass."
+                            "from cache. Contact admin if you need another task."
                         )
                     )
                     mark_failed(
@@ -3487,6 +3579,9 @@ def process_task(task: dict, browser: WtrBrowser):
                 title,
                 xhtml_path,
             )
+            # Count only first-time network success for this user/novel/chapter.
+            if register_chapter_pull(user_id, novel.novel_id, chapter.order):
+                network_fetches_this_run += 1
             completed += 1
 
             now = time.monotonic()
@@ -3507,30 +3602,65 @@ def process_task(task: dict, browser: WtrBrowser):
                         f"📖 Currently At: Chapter {chapter.order}\n"
                         f"🔍 Range: from {start} to {end}\n"
                         f"{unlock_line}\n\n"
-                        f"📌 Status: {completed}/{len(requested)} chapters available "
-                        f"({len(to_fetch)} gap(s) this run)"
+                        f"📌 Status: {completed}/{len(requested)} chapters available"
                     ),
                 )
+
+        # EPUB range: requested span (All = 1..unlocked includes free cache).
+        pack_start, pack_end = start, end
+        if stopped_by_pull_cap:
+            # Pack what we actually have in range (cache + this run).
+            have_nos = [
+                ch.order
+                for ch in requested
+                if cache_has_chapter(novel.novel_id, ch.order)
+            ]
+            if have_nos:
+                pack_end = max(have_nos)
 
         edit_progress(
             progress,
             f"📖 {novel.title}\n\n📚 Checking cache / creating EPUB...",
         )
 
-        # Empty-but-non-zero files (spaces/NULs) still look "present" in the
-        # resume counter — purge + re-download them before packing.
-        repair_bad_chapters(client, novel, novel_dir, start, end, progress)
+        # Repair empty/corrupt files; does not consume CHAPTER_CAP quota.
+        repair_bad_chapters(client, novel, novel_dir, pack_start, pack_end, progress)
 
         edit_progress(
             progress,
             f"📖 {novel.title}\n\n📚 Creating EPUB from cached XHTML...",
         )
-        epub_path = build_epub(novel, novel_dir, start, end)
-        display_title = f"{novel.title} c{start}-{end}"
+        epub_path = build_epub(novel, novel_dir, pack_start, pack_end)
+        display_title = f"{novel.title} c{pack_start}-{pack_end}"
         save_task_cache(task_id, novel.novel_id, epub_path, display_title)
 
         if progress:
             cleanup_bot_message(chat_id, progress.message_id)
+
+        if stopped_by_pull_cap:
+            # Partial relative to request — failed so same-URL continue works later.
+            send_notice(
+                chat_id,
+                (
+                    f"⚠️ Daily chapter limit reached for this novel "
+                    f"({daily_cap if daily_cap > 0 else 'cap'} from the site / 24h).\n"
+                    f"Chapters already on the server are included free.\n"
+                    f"Sending what is available: c{pack_start}-{pack_end}.\n\n"
+                    "📌 Resend the same link or /continue after the limit resets. "
+                    "Contact admin if you need help or another task."
+                ),
+                user_id=user_id,
+            )
+            if send_completed_files(
+                task, novel, novel_dir, epub_path, display_title
+            ):
+                mark_failed(
+                    task_id,
+                    f"Daily chapter limit ({daily_cap}); packed c{pack_start}-{pack_end}",
+                )
+            else:
+                mark_failed(task_id, f"Daily chapter limit ({daily_cap}); upload failed")
+            return
 
         if send_completed_files(
             task,
@@ -3633,9 +3763,10 @@ def cmd_start(message):
         else "• Daily task limit: none\n"
     )
     cap_line = (
-        f"• Chapter cap: {cap}\n"
+        f"• Up to {cap} chapters/day from the site per novel "
+        f"(already on the server are free)\n"
         if cap > 0
-        else "• Chapter cap: none (full novel allowed)\n"
+        else "• No daily chapter limit from the site\n"
     )
     admin_line = ""
     if is_admin(message.from_user.id):
@@ -3648,8 +3779,7 @@ def cmd_start(message):
         msg = bot.reply_to(
             message,
             "📚 <b>Personal WTR-Lab downloader</b>\n\n"
-            "Runs entirely on this PC. Tasks are stored in a local SQLite database "
-            "(not a shared cloud queue).\n\n"
+            "Runs on this server. Tasks are stored in a local SQLite database.\n\n"
             "<b>Commands</b>\n"
             "/download — queue a wtr-lab.com novel\n"
             "/login — magic-link login (if the shared profile is logged out)\n"
@@ -3658,13 +3788,14 @@ def cmd_start(message):
             "/continue — re-queue your latest failed task\n"
             "/cancel — cancel your pending/running tasks\n"
             "/status — worker status\n"
-            "/cap — show chapter cap\n"
+            "/cap — show daily chapter limit\n"
             f"{admin_line}\n"
             f"{limit_line}"
             f"{cap_line}"
-            "Failed/partial downloads: resend the <b>same</b> link or /continue "
-            "to resume from cache. A different novel is blocked while that slot "
-            "is used.\n\n"
+            "Each finished task uses your daily task slot. "
+            "Chapters already downloaded on the server are reused for free. "
+            "Failed/partial: resend the <b>same</b> link or /continue. "
+            "Contact admin if you need help or another task.\n\n"
             "Only links from <code>wtr-lab.com</code> are accepted.",
             parse_mode="HTML",
         )
@@ -3696,7 +3827,8 @@ def cmd_status(message):
             (
                 "🖥 <b>WTR local worker</b>\n"
                 f"SQLite: <code>{html.escape(str(SQLITE_PATH))}</code>\n"
-                f"Chapter cap: {'unlimited' if cap <= 0 else cap}\n"
+                f"Chapters/day from site: "
+                f"{'unlimited' if cap <= 0 else cap}\n"
                 f"Daily task limit: "
                 f"{'none' if DAILY_TASK_LIMIT <= 0 else DAILY_TASK_LIMIT}\n"
                 f"Throttle: {CHAPTER_THROTTLE_MIN:.0f}–{CHAPTER_THROTTLE_MAX:.0f}s"
@@ -3852,11 +3984,22 @@ def cmd_logs(message):
         reply_notice(message, "ℹ️ No task logs found.")
         return
 
+    cap = get_chapter_cap()
     text = "📜 Task Logs (with user details):\n\n"
     for t in rows:
         username = f"@{t['username']}" if t["username"] else "N/A"
         first = t["first_name"] or "N/A"
         last = t["last_name"] or "N/A"
+        nid_match = re.search(r"/novel/(\d+)", t["url"] or "")
+        novel_id = nid_match.group(1) if nid_match else None
+        if novel_id:
+            used = count_chapter_pulls(int(t["user_id"]), novel_id, hours=24)
+            if cap > 0:
+                pull_line = f"📥 Pulls 24h: {used}/{cap}\n"
+            else:
+                pull_line = f"📥 Pulls 24h: {used} (unlimited)\n"
+        else:
+            pull_line = "📥 Pulls 24h: N/A\n"
         text += (
             f"🆔 Task ID: {t['id']}\n"
             f"👤 User ID: {t['user_id']}\n"
@@ -3867,6 +4010,7 @@ def cmd_logs(message):
             f"📌 Status: {t['status']}\n"
             f"🌐 URL: {t['url']}\n"
             f"📖 Range: {t['chapter_range']}\n"
+            f"{pull_line}"
             f"🕒 Created: {t['created_at']}\n"
             f"✅ Completed: {t['completed_at'] or 'Not completed'}\n"
             f"-----------------------------\n"
@@ -3923,15 +4067,16 @@ def cmd_cap(message):
     cap = get_chapter_cap()
     if cap <= 0:
         text = (
-            "Current chapter cap: <b>none</b> (unlimited).\n"
-            "Set <code>CHAPTER_CAP=1000</code> in .env if you want a limit, "
-            "then restart. Or UPDATE settings in SQLite."
+            "Daily chapters from the site: <b>unlimited</b>.\n"
+            "Chapters already on the server are always free.\n"
+            "Set <code>CHAPTER_CAP=1000</code> in .env to limit, then restart."
         )
     else:
         text = (
-            f"Current chapter cap: <b>{cap}</b>\n"
-            "Set <code>CHAPTER_CAP=0</code> in .env for unlimited, then restart. "
-            "Or UPDATE settings in SQLite."
+            f"Daily chapters from the site: <b>{cap}</b> per novel / 24h.\n"
+            "Chapters already on the server are free and do not use that limit.\n"
+            "Each finished task still uses your daily task slot.\n"
+            "Contact admin if you need help or another task."
         )
     reply_notice(message, text, parse_mode="HTML")
 
@@ -4058,23 +4203,14 @@ def on_text(message):
             return
         state["url"] = text
         state["step"] = "range"
-        cap = get_chapter_cap()
         markup = telebot.types.InlineKeyboardMarkup()
-        if cap > 0:
-            all_label = "📚 All (capped)"
-            range_help = (
-                "Select chapter range:\n\n"
-                f"📚 All → chapters 1–{cap}\n"
-                f"↔️ Custom → e.g. 40-60 (max {cap} chapters span)\n\n"
-                "Set CHAPTER_CAP=0 in .env for unlimited."
-            )
-        else:
-            all_label = "📚 All chapters"
-            range_help = (
-                "Select chapter range:\n\n"
-                "📚 All chapters → full novel (no cap)\n"
-                "↔️ Custom range → e.g. 40-60 or 40 60"
-            )
+        all_label = "📚 All chapters"
+        range_help = (
+            "Select chapter range:\n\n"
+            "📚 All chapters → from the start (uses cache + daily site limit)\n"
+            "↔️ Custom range → e.g. 40-60 or 40 60\n\n"
+            "Chapters already on the server are free."
+        )
         markup.add(
             telebot.types.InlineKeyboardButton(
                 all_label, callback_data="range_all"
@@ -4182,7 +4318,10 @@ def worker_loop():
     print(f"Chrome profile: {CHROME_PROFILE_DIR}")
     print(f"Throttle: {CHAPTER_THROTTLE_MIN:.1f}–{CHAPTER_THROTTLE_MAX:.1f}s")
     _cap = get_chapter_cap()
-    print(f"Chapter cap: {'unlimited' if _cap <= 0 else _cap}")
+    print(
+        f"Daily site chapters (CHAPTER_CAP): "
+        f"{'unlimited' if _cap <= 0 else _cap}"
+    )
     if HEADLESS:
         print("HEADLESS=1 — no Chrome window. Set HEADLESS=0 in .env for a visible window.")
     else:
