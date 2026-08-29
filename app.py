@@ -11,8 +11,6 @@ import random
 import re
 import shutil
 import sqlite3
-import subprocess
-import sys
 import threading
 import time
 import urllib.error
@@ -34,9 +32,6 @@ from selenium.common.exceptions import (
     TimeoutException,
     WebDriverException,
 )
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 import telebot
 
 telebot.logger.setLevel(logging.INFO)
@@ -125,51 +120,6 @@ _raw_cap = (os.environ.get("CHAPTER_CAP") or "0").strip()
 DEFAULT_CHAPTER_CAP = int(_raw_cap) if _raw_cap.isdigit() else 0
 DAILY_TASK_LIMIT = int(os.environ.get("DAILY_TASK_LIMIT", "0") or "0")
 
-# 1/true = no Chrome window (Chrome new headless). 0/false = visible window.
-# UC Turnstile mouse-click only works in headed mode.
-_raw_headless = os.environ.get("HEADLESS", "1").strip().lower()
-HEADLESS = _raw_headless not in ("0", "false", "no", "off")
-
-# Extra Chrome flags that cut RAM (GPU, extra renderers, images, crashpad).
-LOW_RAM_CHROME_ARGS = ",".join(
-    [
-        "--disable-gpu",
-        "--disable-gpu-compositing",
-        "--disable-software-rasterizer",
-        "--in-process-gpu",
-        "--disable-3d-apis",
-        "--disable-webgl",
-        "--disable-webgl2",
-        "--disable-accelerated-2d-canvas",
-        "--disable-accelerated-video-decode",
-        "--disable-crash-reporter",
-        "--disable-breakpad",
-        "--disable-extensions",
-        "--disable-component-extensions-with-background-pages",
-        "--disable-component-update",
-        "--disable-background-networking",
-        "--disable-sync",
-        "--disable-translate",
-        "--disable-default-apps",
-        "--disable-hang-monitor",
-        "--disable-domain-reliability",
-        "--disable-client-side-phishing-detection",
-        "--disable-notifications",
-        "--disable-speech-api",
-        "--disable-file-system",
-        "--disable-features=Translate,TranslateUI,AudioServiceOutOfProcess,MediaRouter,DialMediaRouteProvider,OptimizationHints,InterestFeedContentSuggestions,CalculateNativeWinOcclusion,AutofillServerCommunication,HeavyAdIntervention,PaintHolding,IsolateOrigins,site-per-process",
-        "--disable-site-isolation-trials",
-        "--renderer-process-limit=1",
-        "--mute-audio",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--no-pings",
-        "--metrics-recording-only",
-        "--blink-settings=imagesEnabled=false",
-        "--js-flags=--max-old-space-size=128",
-    ]
-)
-
 WTR_HOSTS = {"wtr-lab.com", "www.wtr-lab.com"}
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=True)
@@ -180,8 +130,6 @@ CHROME_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
 stop_event = threading.Event()
 pending_download: dict[int, dict[str, Any]] = {}
-login_lock = threading.Lock()
-current_login_user: Optional[int] = None
 
 
 def is_wtr_url(url: str) -> bool:
@@ -202,16 +150,6 @@ def is_admin(user_id: int) -> bool:
     """Admins skip chapter cap and daily task limits."""
     return user_id in ADMIN_USER_IDS
 
-
-def notify_admin(text: str):
-    """Send a message to ADMIN_CHAT_ID if configured."""
-    if not ADMIN_CHAT_ID:
-        return
-    try:
-        bot.send_message(ADMIN_CHAT_ID, text, parse_mode="HTML", disable_web_page_preview=True)
-    except Exception as e:
-        print(f"[ADMIN NOTIFY ERROR] {e}")
-
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
@@ -225,10 +163,6 @@ class WtrError(Exception):
 
 
 class ManualChallengeRequired(WtrError):
-    pass
-
-
-class LoginRequired(WtrError):
     pass
 
 
@@ -266,8 +200,6 @@ def user_facing_error(error: BaseException) -> str:
         )
     if isinstance(error, ManualChallengeRequired):
         return "Cloudflare Turnstile auto-solve failed. Awaiting human intervention in Chrome."
-    if isinstance(error, LoginRequired):
-        return "WTR-Lab requires login. Use /login or reply with your email when prompted."
     if is_dead_session(error) or isinstance(error, DeadBrowser):
         return "Chrome closed or the browser session died. The worker will reopen Chrome and retry."
     if isinstance(error, TimeoutException) or "script timeout" in str(error).lower():
@@ -855,52 +787,15 @@ def atomic_write_bytes(path: Path, content: bytes):
     temp.replace(path)
 
 
-def release_stale_chrome(reason: str = "") -> None:
-    """
-    SeleniumBase copies chromedriver → uc_driver.exe. If a previous worker
-    left uc_driver/chrome running, Windows raises WinError 32 (file in use).
-    Kill only this worker's Chrome (chrome-profile) plus uc_driver.exe.
-    """
-    if reason:
-        print(f"[BROWSER] Releasing stale Chrome/uc_driver. {reason}")
-    try:
-        if sys.platform == "win32":
-            subprocess.run(
-                ["taskkill", "/F", "/IM", "uc_driver.exe"],
-                capture_output=True,
-                timeout=20,
-            )
-            profile = str(CHROME_PROFILE_DIR.resolve())
-            ps = (
-                "$hint = '" + profile.replace("'", "''") + "'; "
-                "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
-                "ForEach-Object { "
-                "  if ($_.CommandLine -and $_.CommandLine.Contains($hint)) { "
-                "    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue "
-                "  } "
-                "}"
-            )
-            subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps],
-                capture_output=True,
-                timeout=30,
-            )
-        else:
-            subprocess.run(["pkill", "-f", "uc_driver"], capture_output=True, timeout=10)
-    except Exception as error:
-        print(f"[BROWSER] Stale-process cleanup: {error}")
-    time.sleep(1.5)
-
-
 # ---------------------------------------------------------------------------
-# Chrome via SeleniumBase UC Mode (headless by default)
+# Visible local Chrome browser
 # ---------------------------------------------------------------------------
 
 class WtrBrowser:
     """
-    Chrome via SeleniumBase UC Mode, tuned for low RAM.
-    HEADLESS=1 (default): no window, no Turnstile GUI, no extra UC tabs.
-    HEADLESS=0: visible window — only then is Turnstile auto-click used.
+    Headed Chrome via SeleniumBase UC Mode.
+    Uses a dedicated profile (not your daily Chrome profile).
+    Log into WTR-Lab once in the window that opens. Session is reused.
     """
 
     def __init__(self):
@@ -909,59 +804,13 @@ class WtrBrowser:
         self._spawn()
 
     def _spawn(self):
-        kwargs = {
-            "uc": True,
-            "user_data_dir": str(CHROME_PROFILE_DIR),
-            "block_images": True,
-            "disable_gpu": True,
-            "chromium_arg": LOW_RAM_CHROME_ARGS,
-            "pls": "eager",
-        }
-        if HEADLESS:
-            kwargs["headless2"] = True
-            kwargs["headed"] = False
-        else:
-            kwargs["headed"] = True
-        print(
-            f"[BROWSER] Starting Chrome "
-            f"({'headless2, low-RAM, no Turnstile' if HEADLESS else 'headed / visible window'})"
+        self.driver = Driver(
+            uc=True,
+            headed=True,
+            user_data_dir=str(CHROME_PROFILE_DIR),
         )
-        last_error: Optional[BaseException] = None
-        for attempt in range(1, 4):
-            if attempt == 1:
-                release_stale_chrome()
-            try:
-                try:
-                    self.driver = Driver(**kwargs)
-                except TypeError:
-                    kwargs.pop("disable_gpu", None)
-                    kwargs.pop("pls", None)
-                    self.driver = Driver(**kwargs)
-                last_error = None
-                break
-            except PermissionError as error:
-                last_error = error
-                print(
-                    f"[BROWSER] Driver file locked (attempt {attempt}/3): {error}"
-                )
-                release_stale_chrome("WinError 32 — uc_driver still in use")
-                time.sleep(2 * attempt)
-            except Exception as error:
-                text = str(error).lower()
-                if "being used by another process" in text or "winerror 32" in text:
-                    last_error = error
-                    print(
-                        f"[BROWSER] Driver file locked (attempt {attempt}/3): {error}"
-                    )
-                    release_stale_chrome("driver copy locked")
-                    time.sleep(2 * attempt)
-                    continue
-                raise
-        if last_error:
-            raise last_error
         self.driver.set_page_load_timeout(180)
         self.driver.set_script_timeout(180)
-        self._keep_one_tab()
 
     def close(self):
         try:
@@ -970,8 +819,6 @@ class WtrBrowser:
         except Exception:
             pass
         self.driver = None
-        time.sleep(0.8)
-        release_stale_chrome()
 
     def recreate(self, reason: str = ""):
         print(f"[BROWSER] Recreating Chrome. {reason}".strip())
@@ -997,62 +844,12 @@ class WtrBrowser:
             except Exception:
                 pass
 
-    def _keep_one_tab(self):
-        """Close leftover UC / Turnstile tabs so Chrome does not keep extra renderers."""
-        try:
-            handles = list(self.driver.window_handles)
-            if len(handles) <= 1:
-                return
-            keep = self.driver.current_window_handle
-            for handle in handles:
-                if handle == keep:
-                    continue
-                try:
-                    self.driver.switch_to.window(handle)
-                    self.driver.close()
-                except Exception:
-                    pass
-            remaining = list(self.driver.window_handles)
-            if remaining:
-                target = keep if keep in remaining else remaining[0]
-                self.driver.switch_to.window(target)
-        except Exception:
-            pass
-
     def open(self, url: str):
-        if HEADLESS:
-            # uc_open_with_reconnect opens extra tabs (the RAM spike). Skip it.
-            self.driver.get(url)
-            self._keep_one_tab()
-            return
         self.driver.uc_open_with_reconnect(url, 4)
         self._try_solve_turnstile()
-        self._keep_one_tab()
 
     def html(self) -> str:
         return self.driver.get_page_source()
-
-    def is_login_page(self) -> bool:
-        try:
-            src = (self.html() or "").lower()
-            title = (self.driver.get_title() or "").lower()
-            return (
-                "continue with email" in src
-                or "welcome to wtr-lab" in src
-                or "sign in to continue" in src
-                or "login" in title and "wtr" in title
-            )
-        except Exception:
-            return False
-
-    def is_logged_in(self) -> bool:
-        """Quick check: open profile page and see if we land on a login form."""
-        try:
-            self.open("https://wtr-lab.com/en/profile")
-            time.sleep(2.5)
-            return not self.is_login_page()
-        except Exception:
-            return False
 
     def fetch_json(
         self,
@@ -1291,33 +1088,6 @@ class WtrBrowser:
         return base64.b64decode(result) if result else None
 
     def _try_solve_turnstile(self) -> bool:
-        if HEADLESS:
-            # Still detect + notify so admin knows, even if we cannot click.
-            try:
-                title = (self.driver.get_title() or "").lower()
-                source = (self.driver.get_page_source() or "").lower()
-                looks_blocked = (
-                    "cloudflare" in title
-                    or "just a moment" in title
-                    or "turnstile" in source
-                    or "cf-challenge" in source
-                    or "cf-turnstile" in source
-                    or "verify you are human" in source
-                )
-                if looks_blocked:
-                    print("[TURNSTILE] Challenge detected (headless — cannot auto-click).")
-                    self._notify(
-                        "turnstile",
-                        "Turnstile detected in headless mode. Set HEADLESS=0 for auto-click.",
-                    )
-                    notify_admin(
-                        "🛡️ <b>Turnstile challenge</b> detected on the worker (headless).\n"
-                        "Auto-click is disabled. Set <code>HEADLESS=0</code> and use a "
-                        "visible window / VNC to solve it, or use /login after solving."
-                    )
-            except Exception:
-                pass
-            return True
         try:
             title = (self.driver.get_title() or "").lower()
             source = (self.driver.get_page_source() or "").lower()
@@ -1326,44 +1096,22 @@ class WtrBrowser:
                 or "just a moment" in title
                 or "turnstile" in source
                 or "cf-challenge" in source
-                or "cf-turnstile" in source
                 or "verify you are human" in source
             )
             if not looks_blocked:
                 return True
             print("[TURNSTILE] Challenge detected. Trying UC auto-click...")
             self._notify("turnstile", "Opening the chapter page and running UC auto-solve.")
-            notify_admin(
-                "🛡️ <b>Turnstile challenge</b> detected on the worker.\n"
-                "Attempting UC auto-click. If it fails, set <code>HEADLESS=0</code> "
-                "and solve it in the visible Chrome window."
-            )
             self.driver.uc_gui_click_captcha()
             time.sleep(3)
-            self._keep_one_tab()
             return True
         except Exception as error:
             if is_dead_session(error):
                 raise DeadBrowser(str(error)) from error
             print(f"[TURNSTILE] Auto-click failed: {error}")
-            notify_admin(
-                f"🛡️ <b>Turnstile auto-click failed</b>: {html.escape(str(error)[:200])}\n"
-                "Manual intervention may be required."
-            )
             return False
 
     def wait_for_manual_access(self, novel_url: str, reason: str):
-        if HEADLESS:
-            self._notify(
-                "turnstile_failed",
-                "Cloudflare blocked headless Chrome. Turnstile auto-solve is off to save RAM. "
-                "Set HEADLESS=0 in .env to use a visible window.",
-            )
-            raise ManualChallengeRequired(
-                "Cloudflare blocked the headless browser. "
-                "Turnstile solving is disabled in this mode. "
-                "Set HEADLESS=0 in .env, restart, and solve it once in a visible window."
-            )
         if self._try_solve_turnstile():
             title = (self.driver.get_title() or "").lower()
             if "cloudflare" not in title and "just a moment" not in title:
@@ -1383,137 +1131,6 @@ class WtrBrowser:
         except Exception:
             pass
         input("Press Enter only after WTR-Lab works normally in Chrome: ")
-        self._keep_one_tab()
-
-
-
-# ---------------------------------------------------------------------------
-# Magic-link login (self-service for any allowed user)
-# ---------------------------------------------------------------------------
-
-def do_magic_login(
-    chat_id: int,
-    user_id: int,
-    email: str,
-    browser: Optional["WtrBrowser"] = None,
-) -> bool:
-    """
-    Drive the shared Chrome profile through WTR-Lab magic-link login.
-    The user pastes the magic link back into Telegram; we open it in Chrome.
-    """
-    global current_login_user
-    owned = browser is None
-    try:
-        with login_lock:
-            current_login_user = user_id
-
-        if owned:
-            browser = WtrBrowser()
-
-        browser.open("https://wtr-lab.com/en/profile")
-        time.sleep(2)
-
-        if not browser.is_login_page():
-            send_notice(
-                chat_id,
-                "✅ Already logged in on this Chrome profile.",
-                user_id=user_id,
-            )
-            return True
-
-        wait = WebDriverWait(browser.driver, 25)
-        email_input = wait.until(
-            EC.presence_of_element_located(
-                (
-                    By.CSS_SELECTOR,
-                    'input[placeholder*="email" i], input[type="email"]',
-                )
-            )
-        )
-        email_input.clear()
-        email_input.send_keys(email)
-
-        continue_btn = wait.until(
-            EC.element_to_be_clickable(
-                (
-                    By.XPATH,
-                    '//*[contains(text(),"Continue with Email") or '
-                    'contains(text(),"Continue with email")]',
-                )
-            )
-        )
-        continue_btn.click()
-
-        send_notice(
-            chat_id,
-            (
-                f"📬 Magic link requested for <code>{html.escape(email)}</code>.\n"
-                "Check your email (and spam) and paste the <b>full magic link</b> here."
-            ),
-            user_id=user_id,
-            parse_mode="HTML",
-        )
-
-        deadline = time.time() + 360
-        magic_url = None
-        while time.time() < deadline:
-            state = pending_download.get(user_id)
-            if state and state.get("magic_url"):
-                magic_url = state["magic_url"]
-                break
-            time.sleep(1.5)
-
-        if not magic_url:
-            send_notice(
-                chat_id,
-                "⏰ Timed out waiting for the magic link (6 minutes).",
-                user_id=user_id,
-            )
-            return False
-
-        print(f"[LOGIN] Opening magic link for user {user_id}")
-        browser.open(magic_url)
-        time.sleep(6)
-
-        browser.open("https://wtr-lab.com/en/profile")
-        time.sleep(3)
-
-        if browser.is_login_page():
-            send_notice(
-                chat_id,
-                "⚠️ Login may have failed — still seeing the login form.",
-                user_id=user_id,
-            )
-            return False
-
-        send_notice(
-            chat_id,
-            (
-                "✅ <b>Login successful!</b>\n"
-                "The shared Chrome profile is now authenticated.\n"
-                "You and other users can download novels normally."
-            ),
-            user_id=user_id,
-            parse_mode="HTML",
-        )
-        notify_admin(
-            f"✅ User <code>{user_id}</code> successfully logged in via magic link."
-        )
-        return True
-
-    except Exception as e:
-        print(f"[LOGIN ERROR] {type(e).__name__}: {e}")
-        send_notice(chat_id, f"❌ Login failed: {e}", user_id=user_id)
-        return False
-    finally:
-        with login_lock:
-            current_login_user = None
-        state = pending_download.get(user_id)
-        if state and str(state.get("step", "")).startswith("login"):
-            pending_download.pop(user_id, None)
-        if owned and browser:
-            browser.close()
-
 
 # ---------------------------------------------------------------------------
 # WTR-Lab WebToEpub-style parser
@@ -2091,12 +1708,6 @@ class WtrLabClient:
         )
 
     def clear_turnstile(self, novel: NovelInfo, chapter: ChapterInfo, reason: str) -> None:
-        if HEADLESS:
-            raise ManualChallengeRequired(
-                f"Chapter {chapter.order} hit Cloudflare. "
-                "Headless mode does not run Turnstile (saves RAM). "
-                "Set HEADLESS=0 in .env to solve it in a visible window."
-            )
         url = self.chapter_open_url(novel, chapter)
         print(f"[TURNSTILE] {reason}")
         print(f"[TURNSTILE] Opening {url}")
@@ -2113,8 +1724,6 @@ class WtrLabClient:
             if is_dead_session(error):
                 raise DeadBrowser(str(error)) from error
             print(f"[TURNSTILE] Auto-click error: {error}")
-
-        self.browser._keep_one_tab()
 
         title = (self.browser.driver.get_title() or "").lower()
         source = (self.browser.driver.get_page_source() or "").lower()
@@ -3323,26 +2932,6 @@ def process_task(task: dict, browser: WtrBrowser):
             return False
 
     try:
-        # Shared Chrome profile must be logged in for chapter API access.
-        if not browser.is_logged_in():
-            send_notice(
-                chat_id,
-                (
-                    "🔐 <b>Login required</b>\n\n"
-                    "The shared Chrome profile is logged out.\n"
-                    "Please send your email address now to start magic-link login.\n"
-                    "(WTR-Lab accounts are free)"
-                ),
-                user_id=task.get("user_id"),
-                parse_mode="HTML",
-            )
-            pending_download[task["user_id"]] = {
-                "step": "login_email",
-                "from_task": task_id,
-            }
-            requeue_task(task_id)
-            return
-
         client = WtrLabClient(browser)
         novel = client.load_novel(task["url"])
 
@@ -3539,21 +3128,6 @@ def process_task(task: dict, browser: WtrBrowser):
         ):
             mark_done(task_id)
 
-    except LoginRequired:
-        send_notice(
-            chat_id,
-            (
-                "🔐 Login required. Please reply with your email address "
-                "to start magic-link login."
-            ),
-            user_id=task.get("user_id"),
-        )
-        pending_download[task["user_id"]] = {
-            "step": "login_email",
-            "from_task": task_id,
-        }
-        requeue_task(task_id)
-
     except TaskCancelled:
         print(f"[CANCELLED] Task {task_id}")
         if progress:
@@ -3650,7 +3224,6 @@ def cmd_start(message):
             "(not a shared cloud queue).\n\n"
             "<b>Commands</b>\n"
             "/download — queue a wtr-lab.com novel\n"
-            "/login — magic-link login (if the shared profile is logged out)\n"
             "/queue — your pending/running tasks\n"
             "/mytasks — your recent tasks (any status)\n"
             "/continue — re-queue your latest failed task\n"
@@ -3669,18 +3242,6 @@ def cmd_start(message):
         track_and_autodelete(msg, message.from_user.id, DELETE_AFTER_LIST)
     except Exception as error:
         print(f"[TELEGRAM ERROR] {error}")
-
-
-@bot.message_handler(commands=["login"])
-def cmd_login(message):
-    if deny_if_needed(message):
-        return
-    pending_download[message.from_user.id] = {"step": "login_email"}
-    reply_notice(
-        message,
-        "📧 Send the email address for WTR-Lab magic-link login.\n"
-        "(Accounts are free — any email works)",
-    )
 
 
 @bot.message_handler(commands=["status"])
@@ -4013,39 +3574,6 @@ def on_text(message):
 
     text = message.text.strip()
 
-    if state.get("step") == "login_email":
-        email = text.strip()
-        if "@" not in email or "." not in email.split("@")[-1]:
-            reply_notice(message, "Please send a valid email address.")
-            return
-        state["email"] = email
-        state["step"] = "login_waiting_link"
-        reply_notice(
-            message,
-            f"⏳ Starting magic-link login for <code>{html.escape(email)}</code>…",
-            parse_mode="HTML",
-        )
-        threading.Thread(
-            target=do_magic_login,
-            args=(message.chat.id, uid, email),
-            daemon=True,
-        ).start()
-        return
-
-    if state.get("step") == "login_waiting_link":
-        if not text.startswith("http"):
-            reply_notice(
-                message,
-                "Please send the full magic link (it should start with https://).",
-            )
-            return
-        state["magic_url"] = text
-        reply_notice(
-            message,
-            "✅ Magic link received. Completing login on the worker…",
-        )
-        return
-
     if state.get("step") == "url":
         if not is_wtr_url(text):
             reply_notice(
@@ -4174,17 +3702,13 @@ def on_range_choice(call):
 def worker_loop():
     recover_interrupted_tasks()
     print("=" * 78)
-    print("WTR-Lab LOCAL worker (SQLite queue) + self-service magic-link login")
+    print("WTR-Lab LOCAL worker (SQLite queue)")
     print(f"SQLite: {SQLITE_PATH}")
-    print(f"Chrome: {'headless2 low-RAM (no window, no Turnstile)' if HEADLESS else 'headed (visible)'}")
     print(f"Chrome profile: {CHROME_PROFILE_DIR}")
     print(f"Throttle: {CHAPTER_THROTTLE_MIN:.1f}–{CHAPTER_THROTTLE_MAX:.1f}s")
     _cap = get_chapter_cap()
     print(f"Chapter cap: {'unlimited' if _cap <= 0 else _cap}")
-    if HEADLESS:
-        print("HEADLESS=1 — no Chrome window. Set HEADLESS=0 in .env for a visible window.")
-    else:
-        print("Log into WTR-Lab in the Chrome window if needed.")
+    print("Log into WTR-Lab in the Chrome window if needed.")
     print("=" * 78)
 
     browser = WtrBrowser()
