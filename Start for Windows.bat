@@ -42,6 +42,15 @@ $Marker     = Join-Path $ProjectRoot "data\.setup_done"
 
 $GithubZipUrl = "https://github.com/patrick-mulinge/WTR-Lab-crawler/archive/refs/heads/main.zip"
 
+# Pinned official installer used only if winget is missing / fails.
+# 3.12 is widely compatible with SeleniumBase / this worker.
+$PythonVersion = "3.12.10"
+$PythonWingetIds = @(
+    "Python.Python.3.12",
+    "Python.Python.3.13",
+    "Python.Python.3.11"
+)
+
 function Write-Info($msg)  { Write-Host "[*] $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)    { Write-Host "[+] $msg" -ForegroundColor Green }
 function Write-Warn($msg)  { Write-Host "[!] $msg" -ForegroundColor Yellow }
@@ -142,34 +151,226 @@ function Ensure-Chrome {
     Install-Chrome
 }
 
-function Ensure-Python {
+function Refresh-SessionPath {
+    $machine = [Environment]::GetEnvironmentVariable("Path", "Machine")
+    $user    = [Environment]::GetEnvironmentVariable("Path", "User")
+    $parts = @()
+    if ($machine) { $parts += $machine }
+    if ($user)    { $parts += $user }
+    if ($parts.Count -gt 0) {
+        $env:Path = ($parts -join ";")
+    }
+}
+
+function Invoke-PythonCmd {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Command,
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [string[]]$Rest
+    )
+    $exe = $Command[0]
+    $argsList = New-Object System.Collections.Generic.List[string]
+    if ($Command.Count -gt 1) {
+        foreach ($item in $Command[1..($Command.Count - 1)]) {
+            [void]$argsList.Add($item)
+        }
+    }
+    if ($Rest) {
+        foreach ($item in $Rest) { [void]$argsList.Add($item) }
+    }
+    & $exe @argsList
+}
+
+function Test-PythonVersionOk {
+    param([string[]]$Command)
+    if (-not $Command -or $Command.Count -eq 0) { return $false }
+    $exe = $Command[0]
+    if ($exe -match '[\\/]' -and -not (Test-Path -LiteralPath $exe)) { return $false }
+    # Skip the Microsoft Store stub (opens the Store instead of Python).
+    if ($exe -match '\\WindowsApps\\python(\.exe)?$') { return $false }
     try {
-        $ver = & python --version 2>&1
-        Write-Ok "Python found: $ver"
-        return
-    } catch { }
+        $oldEap = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        Invoke-PythonCmd $Command -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" 2>$null | Out-Null
+        $ok = ($LASTEXITCODE -eq 0)
+        $ErrorActionPreference = $oldEap
+        return $ok
+    } catch {
+        return $false
+    }
+}
+
+function Get-PythonInstallPaths {
+    $globs = @(
+        "$env:LocalAppData\Programs\Python\Python3*\python.exe",
+        "$env:ProgramFiles\Python3*\python.exe",
+        "${env:ProgramFiles(x86)}\Python3*\python.exe"
+    )
+    $found = @()
+    foreach ($g in $globs) {
+        $found += @(Get-Item -Path $g -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
+    }
+    return $found
+}
+
+function Find-PythonCommand {
+    Refresh-SessionPath
+
+    foreach ($path in (Get-PythonInstallPaths)) {
+        if (Test-PythonVersionOk @($path)) { return @($path) }
+    }
+
     try {
-        $ver = & py -3 --version 2>&1
-        Write-Ok "Python found via py launcher: $ver"
-        return
+        $py = Get-Command py -ErrorAction Stop
+        if (Test-PythonVersionOk @($py.Source, "-3")) { return @($py.Source, "-3") }
     } catch { }
 
-    Write-Err "Python 3.10+ is not installed or not on PATH."
+    try {
+        $cmd = Get-Command python -ErrorAction Stop
+        if ($cmd.Source -notmatch '\\WindowsApps\\' -and (Test-PythonVersionOk @($cmd.Source))) {
+            return @($cmd.Source)
+        }
+    } catch { }
+
+    try {
+        $cmd = Get-Command python3 -ErrorAction Stop
+        if ($cmd.Source -notmatch '\\WindowsApps\\' -and (Test-PythonVersionOk @($cmd.Source))) {
+            return @($cmd.Source)
+        }
+    } catch { }
+
+    return $null
+}
+
+function Get-PythonArchSuffix {
+    $arch = $env:PROCESSOR_ARCHITECTURE
+    if ($arch -eq "ARM64") { return "arm64" }
+    return "amd64"
+}
+
+function Install-PythonViaWinget {
+    try {
+        $null = Get-Command winget -ErrorAction Stop
+    } catch {
+        Write-Warn "winget is not available."
+        return $false
+    }
+
+    foreach ($id in $PythonWingetIds) {
+        Write-Info "Trying winget install $id ..."
+        try {
+            $oldEap = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            & winget install -e --id $id --accept-package-agreements --accept-source-agreements --disable-interactivity
+            $code = $LASTEXITCODE
+            $ErrorActionPreference = $oldEap
+            # 0 = installed, -1978335189 / 0x8A15002B often means already installed
+            if ($code -eq 0 -or $code -eq -1978335189) {
+                Refresh-SessionPath
+                if (Find-PythonCommand) { return $true }
+            }
+        } catch {
+            Write-Warn "winget $id failed: $_"
+        }
+    }
+    return $false
+}
+
+function Install-PythonViaOfficialInstaller {
+    $suffix = Get-PythonArchSuffix
+    $fileName = "python-$PythonVersion-$suffix.exe"
+    $url = "https://www.python.org/ftp/python/$PythonVersion/$fileName"
+    $tmp = Join-Path $env:TEMP $fileName
+
+    Write-Info "Downloading official Python $PythonVersion ($suffix)..."
+    Write-Host "    $url"
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
+    } catch {
+        Write-Warn "Download failed: $_"
+        return $false
+    }
+
+    if (-not (Test-Path -LiteralPath $tmp) -or ((Get-Item $tmp).Length -lt 1MB)) {
+        Write-Warn "Downloaded installer looks invalid."
+        return $false
+    }
+
+    Write-Info "Running silent Python installer (Add to PATH, pip, py launcher)..."
+    Write-Host "    Windows may show a UAC prompt — accept it."
+
+    $common = @(
+        "/quiet",
+        "PrependPath=1",
+        "Include_pip=1",
+        "Include_launcher=1",
+        "Include_test=0",
+        "Include_doc=0",
+        "SimpleInstall=1"
+    )
+
+    try {
+        $p = Start-Process -FilePath $tmp -ArgumentList ($common + @("InstallAllUsers=0")) -Wait -PassThru
+        Refresh-SessionPath
+        if ($p.ExitCode -eq 0 -and (Find-PythonCommand)) { return $true }
+
+        Write-Warn "Per-user install did not register Python. Retrying for all users..."
+        $p = Start-Process -FilePath $tmp -ArgumentList ($common + @("InstallAllUsers=1")) -Wait -PassThru
+        Refresh-SessionPath
+        if ($p.ExitCode -eq 0 -and (Find-PythonCommand)) { return $true }
+
+        Write-Warn "Installer exit code: $($p.ExitCode)"
+        return $false
+    } catch {
+        Write-Warn "Official installer failed: $_"
+        return $false
+    } finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Ensure-Python {
+    $found = Find-PythonCommand
+    if ($found) {
+        $label = ($found -join " ")
+        Write-Ok "Python found: $label"
+        try {
+            $ver = Invoke-PythonCmd $found --version 2>&1
+            if ($ver) { Write-Ok "$ver" }
+        } catch { }
+        return
+    }
+
+    Write-Warn "Python 3.10+ was not found. Installing automatically..."
+
+    $ok = $false
+    if (Install-PythonViaWinget) {
+        $ok = $true
+        Write-Ok "Python installed via winget."
+    } elseif (Install-PythonViaOfficialInstaller) {
+        $ok = $true
+        Write-Ok "Python installed via official installer."
+    }
+
+    Refresh-SessionPath
+    $found = Find-PythonCommand
+    if ($found) {
+        Write-Ok "Python is ready: $($found -join ' ')"
+        return
+    }
+
+    Write-Err "Automatic Python install did not finish."
     Write-Host "Download: https://www.python.org/downloads/"
     Write-Host "During setup, enable: Add python.exe to PATH"
+    Write-Host "Then close this window and run the script again."
     Start-Process "https://www.python.org/downloads/"
     exit 1
 }
 
 function Get-PythonCmd {
-    try {
-        & python -c "import sys; assert sys.version_info >= (3, 10)" 2>$null
-        if ($LASTEXITCODE -eq 0) { return "python" }
-    } catch { }
-    try {
-        & py -3 -c "import sys; assert sys.version_info >= (3, 10)" 2>$null
-        if ($LASTEXITCODE -eq 0) { return "py -3" }
-    } catch { }
+    $found = Find-PythonCommand
+    if ($found) { return $found }
     Write-Err "Need Python 3.10 or newer."
     exit 1
 }
@@ -181,11 +382,7 @@ function Ensure-Venv {
     }
     Write-Info "Creating virtual environment (.venv)..."
     $py = Get-PythonCmd
-    if ($py -eq "py -3") {
-        & py -3 -m venv .venv
-    } else {
-        & python -m venv .venv
-    }
+    Invoke-PythonCmd $py -m venv .venv
     if (-not (Test-Path -LiteralPath $VenvPython)) {
         Write-Err "Failed to create .venv"
         exit 1
