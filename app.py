@@ -395,8 +395,13 @@ def setup_local_db():
                 ON chapter_pulls (user_id, novel_id, pulled_at);
             """
         )
+        # Always sync CHAPTER_CAP from .env so changing the env takes effect
+        # (INSERT OR IGNORE left stale 0 values forever).
         conn.execute(
-            "INSERT OR IGNORE INTO settings(key, value) VALUES ('chapter_cap', ?)",
+            """
+            INSERT INTO settings(key, value) VALUES ('chapter_cap', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
             (str(DEFAULT_CHAPTER_CAP),),
         )
         # Existing installs may predate these columns.
@@ -434,17 +439,22 @@ def get_chapter_cap() -> int:
     """
     Max first-time network chapter fetches per user per novel per 24h
     (CHAPTER_CAP in .env). 0 = unlimited. Cache hits do not count.
+
+    .env is the source of truth; the settings row is kept in sync on startup.
     """
+    # Prefer the value loaded from .env at process start.
+    if DEFAULT_CHAPTER_CAP >= 0:
+        return DEFAULT_CHAPTER_CAP
     conn = local_db()
     try:
         row = conn.execute(
             "SELECT value FROM settings WHERE key='chapter_cap'"
         ).fetchone()
         if not row:
-            return DEFAULT_CHAPTER_CAP
+            return 0
         return max(0, int(row["value"]))
     except Exception:
-        return DEFAULT_CHAPTER_CAP
+        return 0
     finally:
         conn.close()
 
