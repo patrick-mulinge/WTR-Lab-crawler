@@ -128,7 +128,7 @@ DAILY_TASK_LIMIT = int(os.environ.get("DAILY_TASK_LIMIT", "0") or "0")
 # 1/true = no Chrome window (Chrome new headless). 0/false = visible window.
 # UC Turnstile mouse-click only works in headed mode.
 # Default when HEADLESS is not set in .env is now headed/visible (0).
-_raw_headless = os.environ.get("HEADLESS", "0").strip().lower()
+_raw_headless = os.environ.get("HEADLESS", "1").strip().lower()
 HEADLESS = _raw_headless not in ("0", "false", "no", "off")
 
 # Extra Chrome flags. Headed mode keeps images/WebGL so Turnstile/captcha can work.
