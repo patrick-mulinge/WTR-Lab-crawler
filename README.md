@@ -59,6 +59,8 @@ Useful commands:
 tail -f ~/bot.log                                             # follow the log
 pkill -9 -f 'app.py|uc_driver|google-chrome|chrome|chromedriver'   # stop everything
 ```
+### Other Linux Distros
+For other Linux distriutions, take **Start for Linux.sh** and give it to an AI like claude or grok and tell it to make it work on your Operating System, it's just a small change that they can handle.
 
 **Non-interactive setup (no TTY):** export the values first, or pre-create `.env`:
 
