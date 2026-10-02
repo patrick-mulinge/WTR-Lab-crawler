@@ -1841,6 +1841,83 @@ def pick_english(*values: Any) -> str:
     return texts[0] if texts else ""
 
 
+def _shrink_for_debug(obj: Any, depth: int = 0) -> Any:
+    """Truncate long strings/lists so a response can be dumped safely."""
+    if depth > 8:
+        return "<max depth>"
+    if isinstance(obj, dict):
+        return {str(k): _shrink_for_debug(v, depth + 1) for k, v in list(obj.items())[:40]}
+    if isinstance(obj, list):
+        items = [_shrink_for_debug(v, depth + 1) for v in obj[:5]]
+        if len(obj) > 5:
+            items.append(f"<{len(obj) - 5} more items>")
+        return items
+    if isinstance(obj, str):
+        return obj if len(obj) <= 200 else obj[:200] + f"...<{len(obj)} chars>"
+    return obj
+
+
+def locate_chapter_body(response: Any) -> tuple[dict, Any]:
+    """
+    Find the chapter body in a /api/reader/get response.
+
+    Preferred layout is response["data"]["data"]["body"]. If WTR-Lab moves
+    it, fall back to any nearby "body" key, then a bounded recursive search.
+    Returns (container_dict, body). body is None when nothing usable exists.
+    """
+    def usable(value: Any) -> bool:
+        return isinstance(value, (list, str)) and len(value) > 0
+
+    for keys in (
+        ("data", "data"),
+        ("data",),
+        ("chapter",),
+        (),
+    ):
+        container = nested(response, *keys, default=None) if keys else response
+        if isinstance(container, dict) and usable(container.get("body")):
+            return container, container.get("body")
+
+    def walk(obj: Any, depth: int = 0):
+        if depth > 6:
+            return None
+        if isinstance(obj, dict):
+            if usable(obj.get("body")):
+                return obj, obj.get("body")
+            for value in obj.values():
+                found = walk(value, depth + 1)
+                if found:
+                    return found
+        elif isinstance(obj, list):
+            for value in obj[:10]:
+                found = walk(value, depth + 1)
+                if found:
+                    return found
+        return None
+
+    found = walk(response)
+    if found:
+        return found
+
+    inner = nested(response, "data", "data", default={})
+    return (inner if isinstance(inner, dict) else {}), None
+
+
+def dump_chapter_debug(order: int, response: Any) -> Optional[Path]:
+    try:
+        debug_dir = DATA_DIR / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        path = debug_dir / f"chapter_{order}_response.json"
+        path.write_text(
+            json.dumps(_shrink_for_debug(response), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return path
+    except Exception as error:
+        print(f"[DEBUG DUMP ERROR] {error}")
+        return None
+
+
 def decrypt_body(encrypted: Any) -> list[str]:
     """
     Same AES-GCM body format handled by the current WTR-Lab crawler.
@@ -2548,8 +2625,57 @@ class WtrLabClient:
             )
             raise WtrError(f"Chapter {chapter.order} failed: {message}")
 
-        data = nested(response, "data", "data", default={}) or {}
-        body_lines = decrypt_body(data.get("body"))
+        data, raw_body = locate_chapter_body(response)
+
+        # WTR-Lab now often returns only a pointer ("content_url") instead of
+        # the body. Fetch it with the same browser session, then look for the
+        # body (and glossary/images/patch) inside that second response.
+        content_url = (
+            response.get("content_url") if isinstance(response, dict) else None
+        )
+        if raw_body is None and isinstance(content_url, str) and content_url.strip():
+            content_response = self._fetch_content_url(
+                novel,
+                chapter,
+                content_url.strip(),
+                task_id=task_id,
+                chat_id=chat_id,
+                user_id=user_id,
+            )
+            data, raw_body = self._body_from_content_response(content_response)
+            if raw_body is None:
+                dump_chapter_debug(chapter.order, {
+                    "first_response": response,
+                    "content_response": content_response,
+                })
+                top_keys = (
+                    list(content_response.keys())
+                    if isinstance(content_response, dict)
+                    else type(content_response).__name__
+                )
+                print(
+                    f"[NO BODY] Chapter {chapter.order}: content_url response "
+                    f"keys={top_keys}"
+                )
+                raise WtrError(
+                    f"Chapter {chapter.order}: content_url returned no readable "
+                    f"body (keys: {top_keys}). Debug copy saved under data/debug/."
+                )
+
+        if raw_body is None:
+            dump_path = dump_chapter_debug(chapter.order, response)
+            top_keys = list(response.keys()) if isinstance(response, dict) else []
+            inner_keys = list(data.keys()) if isinstance(data, dict) else []
+            print(
+                f"[NO BODY] Chapter {chapter.order}: response keys={top_keys} "
+                f"data.data keys={inner_keys} dump={dump_path}"
+            )
+            raise WtrError(
+                f"Chapter {chapter.order}: site returned no readable body "
+                f"(response keys: {top_keys}, data keys: {inner_keys}). "
+                "Debug copy saved under data/debug/."
+            )
+        body_lines = decrypt_body(raw_body)
         actual_title = str(
             nested(response, "chapter", "title", default=None)
             or chapter.title
@@ -2564,6 +2690,86 @@ class WtrLabClient:
             novel_dir=novel_dir,
         )
         return actual_title, xhtml
+
+    def _fetch_content_url(
+        self,
+        novel: NovelInfo,
+        chapter: ChapterInfo,
+        content_url: str,
+        *,
+        task_id: Optional[int] = None,
+        chat_id: Optional[int] = None,
+        user_id: Optional[int] = None,
+    ) -> Any:
+        """GET the chapter content pointer returned by /api/reader/get."""
+        if content_url.startswith("//"):
+            url = "https:" + content_url
+        elif content_url.startswith("/"):
+            url = "https://wtr-lab.com" + content_url
+        else:
+            url = content_url
+
+        status, content = None, None
+        for attempt in range(1, 4):
+            status, content = self.browser.fetch_json(url, method="GET")
+            if status == 200:
+                return content
+
+            blocked = is_challenge(status, content) or (
+                isinstance(content, dict)
+                and "turnstile" in str(content.get("message", "")).lower()
+            )
+            if blocked:
+                self.clear_turnstile(
+                    novel,
+                    chapter,
+                    reason=(
+                        f"Chapter {chapter.order} content blocked "
+                        f"(attempt {attempt}/3)"
+                    ),
+                    task_id=task_id if task_id is not None else self.task_id,
+                    chat_id=chat_id if chat_id is not None else self.chat_id,
+                    user_id=user_id if user_id is not None else self.user_id,
+                )
+                continue
+
+            if status in (0, 502, 503, 504, 522, 524):
+                time.sleep(5 * attempt)
+                continue
+            break
+
+        dump_chapter_debug(
+            chapter.order, {"content_url": url, "status": status, "response": content}
+        )
+        raise WtrError(
+            f"Chapter {chapter.order}: content request failed "
+            f"(HTTP {status}). Debug copy saved under data/debug/."
+        )
+
+    @staticmethod
+    def _body_from_content_response(content: Any) -> tuple[dict, Any]:
+        """
+        The content endpoint may return JSON in several shapes, or the raw
+        encrypted string itself ("arr:..." / "str:...", wrapped in raw_text).
+        """
+        if isinstance(content, dict) and set(content.keys()) == {"raw_text"}:
+            text = str(content.get("raw_text") or "").strip()
+            if text.startswith(("arr:", "str:")):
+                return {}, text
+            # Plain JSON-in-text or plain text.
+            try:
+                content = json.loads(text)
+            except Exception:
+                return {}, ([text] if text else None)
+
+        if isinstance(content, str):
+            text = content.strip()
+            return {}, (text if text else None)
+
+        if isinstance(content, list):
+            return {}, (content if content else None)
+
+        return locate_chapter_body(content)
 
     def build_xhtml(
         self,
