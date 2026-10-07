@@ -1475,21 +1475,36 @@ class RemoteSolve:
                 return None
 
             if not _port_open(NOVNC_PORT):
-                websockify = shutil.which("websockify")
-                command = [websockify] if websockify else [sys.executable, "-m", "websockify"]
-                command += [
+                # Always use the same Python that is running the bot (venv).
+                command = [
+                    sys.executable, "-m", "websockify",
                     "--web", NOVNC_WEB_DIR,
-                    f"127.0.0.1:{NOVNC_PORT}", f"127.0.0.1:{VNC_PORT}",
+                    f"127.0.0.1:{NOVNC_PORT}",
+                    f"127.0.0.1:{VNC_PORT}",
                 ]
+                print(f"[REMOTE] starting websockify: {' '.join(command)}")
                 proc = subprocess.Popen(
-                    command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
                 )
                 self.procs.append(proc)
-                time.sleep(1.5)
+                time.sleep(2.0)
                 if proc.poll() is not None or not _port_open(NOVNC_PORT):
-                    print("[REMOTE] websockify failed to start")
+                    out = ""
+                    try:
+                        out = (proc.stdout.read() or "")[-2000:] if proc.stdout else ""
+                    except Exception:
+                        pass
+                    print(
+                        f"[REMOTE] websockify failed to start "
+                        f"(exit={proc.poll()}, port_open={_port_open(NOVNC_PORT)})\n"
+                        f"{out or '(no output)'}"
+                    )
                     self.stop("websockify failed")
                     return None
+                print(f"[REMOTE] websockify listening on 127.0.0.1:{NOVNC_PORT}")
 
             tunnel = subprocess.Popen(
                 [cloudflared, "tunnel", "--no-autoupdate", "--url",
