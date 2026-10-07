@@ -13,6 +13,9 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import queue
+import secrets
+import socket
 import threading
 import time
 import urllib.error
@@ -128,8 +131,79 @@ DAILY_TASK_LIMIT = int(os.environ.get("DAILY_TASK_LIMIT", "0") or "0")
 # 1/true = no Chrome window (Chrome new headless). 0/false = visible window.
 # Default when HEADLESS is not set: headed/visible (0) so admin can solve
 # Cloudflare Turnstile over VNC. Auto-click is disabled on all platforms.
-_raw_headless = os.environ.get("HEADLESS", "0").strip().lower()
-HEADLESS = _raw_headless not in ("0", "false", "no", "off")
+_TRUE_WORDS = {"1", "true", "yes", "y", "on", "enable", "enabled"}
+_FALSE_WORDS = {"0", "false", "no", "n", "off", "disable", "disabled"}
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    """
+    On/off setting. yes / 1 / true / on  = on;  no / 0 / false / off = off.
+    Unset or blank uses the default; an unrecognised word also uses the default.
+    """
+    raw = (os.environ.get(name) or "").strip().lower()
+    if raw in _TRUE_WORDS:
+        return True
+    if raw in _FALSE_WORDS:
+        return False
+    if raw:
+        print(f"[CONFIG] {name}={raw!r} is not yes/no — using the default ({default}).")
+    return default.strip().lower() in _TRUE_WORDS
+
+
+def _env_minutes(name: str, default: int) -> int:
+    """
+    Minutes setting where blank / 0 / no / off / none / null / never means
+    "no limit" (returns 0). Unset uses the default.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    raw = raw.strip().lower()
+    if raw in ("", "0", "no", "n", "off", "none", "null", "never", "false", "unlimited"):
+        return 0
+    try:
+        return max(0, int(float(raw)))
+    except ValueError:
+        print(f"[CONFIG] {name}={raw!r} is not a number — using {default}.")
+        return default
+
+
+HEADLESS = _env_flag("HEADLESS", "0")
+
+
+# One-time browser link (noVNC over a cloudflared quick tunnel) so the USER whose
+# download is blocked can tick the Cloudflare checkbox themselves. Needs a VNC
+# server showing the Chrome window, websockify + noVNC, and cloudflared.
+REMOTE_SOLVE = _env_flag("REMOTE_SOLVE", "0")
+VNC_PORT = int(os.environ.get("VNC_PORT", "5901") or "5901")
+NOVNC_PORT = int(os.environ.get("NOVNC_PORT", "6080") or "6080")
+CLOUDFLARED_BIN = os.environ.get("CLOUDFLARED_BIN", "cloudflared").strip() or "cloudflared"
+# Blank / 0 / no / none = the link never expires (waits until /solved or the task ends).
+REMOTE_LINK_MAX_MINUTES = _env_minutes("REMOTE_LINK_MAX_MINUTES", 20)
+
+
+def _find_novnc_dir() -> str:
+    configured = (os.environ.get("NOVNC_WEB_DIR") or "").strip()
+    if configured:
+        return configured
+    for candidate in (
+        "/usr/share/novnc",
+        "/usr/share/webapps/novnc",
+        str(Path.home() / "noVNC"),
+        str(Path(__file__).resolve().parent / "noVNC"),
+    ):
+        if (Path(candidate) / "vnc.html").is_file():
+            return candidate
+    return "/usr/share/novnc"
+
+
+NOVNC_WEB_DIR = _find_novnc_dir()
+# Log refreshes, key combos, clicks, new tabs and DevTools while a remote link is
+# open. Uses page scripts + DevTools protocol, which Cloudflare may notice; set
+# ACTIVITY_DEEP=0 to log only tabs, URL changes and login-screen detection.
+ACTIVITY_DEEP = _env_flag("ACTIVITY_DEEP", "1")
+# Optional: open Chrome in --app mode (no tab strip / address bar).
+CHROME_APP_MODE = _env_flag("CHROME_APP_MODE", "0")
 
 # Extra Chrome flags. Headed mode keeps images/WebGL so Turnstile/captcha can work.
 # Headless stays lighter. Do not disable images/webgl when HEADLESS=0.
@@ -155,6 +229,8 @@ _HEADLESS_CHROME_ARGS = ",".join(
         "--renderer-process-limit=2",
     ]
 )
+if CHROME_APP_MODE and not HEADLESS:
+    _HEADED_CHROME_ARGS += ",--app=https://wtr-lab.com/en"
 LOW_RAM_CHROME_ARGS = (
     _HEADLESS_CHROME_ARGS if HEADLESS else _HEADED_CHROME_ARGS
 )
@@ -179,6 +255,15 @@ solved_event = threading.Event()
 # Populated while the crawler is blocked on a captcha (single worker).
 captcha_wait: dict[str, Any] = {}
 
+# Logged-out handling for the shared WTR-Lab account in the Chrome profile.
+# The worker thread is the ONLY thread that drives Chrome: /login requests are
+# queued here and executed by the worker (a second Chrome on the same profile
+# kills the running one).
+LOGIN_RECHECK_SECONDS = 120
+login_wait: dict[str, Any] = {}      # set while the worker waits for a re-login
+session_state = "unknown"            # "unknown" | "ok" | "logged_out"
+login_requests: "queue.Queue[dict[str, Any]]" = queue.Queue()
+
 
 def is_wtr_url(url: str) -> bool:
     try:
@@ -189,6 +274,8 @@ def is_wtr_url(url: str) -> bool:
 
 
 def user_allowed(user_id: int) -> bool:
+    if not is_admin(user_id) and get_ban(user_id):
+        return False
     if not ALLOWED_USER_IDS:
         return True
     return user_id in ALLOWED_USER_IDS
@@ -399,6 +486,34 @@ def setup_local_db():
 
             CREATE INDEX IF NOT EXISTS chapter_pulls_user_novel_time_idx
                 ON chapter_pulls (user_id, novel_id, pulled_at);
+
+            CREATE TABLE IF NOT EXISTS user_bans (
+                user_id INTEGER PRIMARY KEY,
+                banned_until TEXT,
+                reason TEXT,
+                banned_by INTEGER,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS user_limits (
+                user_id INTEGER PRIMARY KEY,
+                chapter_cap INTEGER NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS user_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL DEFAULT (datetime('now')),
+                session_id TEXT,
+                task_id INTEGER,
+                user_id INTEGER,
+                username TEXT,
+                kind TEXT NOT NULL,
+                detail TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS user_actions_user_idx
+                ON user_actions (user_id, id);
             """
         )
         # Always sync CHAPTER_CAP from .env so changing the env takes effect
@@ -441,7 +556,189 @@ def setup_local_db():
         conn.close()
 
 
-def get_chapter_cap() -> int:
+# ---------------------------------------------------------------------------
+# Bans, per-user chapter limit overrides, and the action log
+# ---------------------------------------------------------------------------
+
+def get_ban(user_id: int) -> Optional[dict]:
+    """Active ban for this user, or None. Expired timed bans are removed."""
+    conn = local_db()
+    try:
+        row = conn.execute(
+            "SELECT user_id, banned_until, reason FROM user_bans WHERE user_id = ?",
+            (int(user_id),),
+        ).fetchone()
+        if not row:
+            return None
+        until = row["banned_until"]
+        if until:
+            expired = conn.execute(
+                "SELECT datetime('now') >= ?", (until,)
+            ).fetchone()[0]
+            if expired:
+                conn.execute("DELETE FROM user_bans WHERE user_id = ?", (int(user_id),))
+                conn.commit()
+                return None
+        return {"user_id": row["user_id"], "until": until, "reason": row["reason"] or ""}
+    except Exception as error:
+        print(f"[BAN CHECK ERROR] {error}")
+        return None
+    finally:
+        conn.close()
+
+
+def ban_user(user_id: int, days: Optional[int], by: int, reason: str = "") -> Optional[str]:
+    """Ban forever (days=None) or for N days. Returns the expiry text or None."""
+    conn = local_db()
+    try:
+        until = None
+        if days is not None:
+            until = conn.execute(
+                "SELECT datetime('now', ?)", (f"+{int(days)} days",)
+            ).fetchone()[0]
+        conn.execute(
+            """
+            INSERT INTO user_bans (user_id, banned_until, reason, banned_by)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                banned_until = excluded.banned_until,
+                reason = excluded.reason,
+                banned_by = excluded.banned_by,
+                created_at = datetime('now')
+            """,
+            (int(user_id), until, reason, int(by)),
+        )
+        conn.commit()
+        return until
+    finally:
+        conn.close()
+
+
+def unban_user(user_id: int) -> bool:
+    conn = local_db()
+    try:
+        cur = conn.execute("DELETE FROM user_bans WHERE user_id = ?", (int(user_id),))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def resolve_user_ref(ref: str) -> Optional[int]:
+    """Numeric Telegram id, or @username seen in tasks / the action log."""
+    ref = (ref or "").strip()
+    if ref.lstrip("-").isdigit():
+        return int(ref)
+    name = ref.lstrip("@").strip().lower()
+    if not name:
+        return None
+    conn = local_db()
+    try:
+        row = conn.execute(
+            "SELECT user_id FROM tasks WHERE lower(username) = ? ORDER BY id DESC LIMIT 1",
+            (name,),
+        ).fetchone()
+        if not row:
+            row = conn.execute(
+                "SELECT user_id FROM user_actions WHERE lower(username) = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (name,),
+            ).fetchone()
+        return int(row["user_id"]) if row and row["user_id"] is not None else None
+    finally:
+        conn.close()
+
+
+def username_for(user_id: Optional[int]) -> str:
+    if user_id is None:
+        return ""
+    conn = local_db()
+    try:
+        row = conn.execute(
+            "SELECT username FROM tasks WHERE user_id = ? AND username IS NOT NULL "
+            "AND username != '' ORDER BY id DESC LIMIT 1",
+            (int(user_id),),
+        ).fetchone()
+        return (row["username"] or "") if row else ""
+    except Exception:
+        return ""
+    finally:
+        conn.close()
+
+
+def get_user_cap_override(user_id: int) -> Optional[int]:
+    conn = local_db()
+    try:
+        row = conn.execute(
+            "SELECT chapter_cap FROM user_limits WHERE user_id = ?", (int(user_id),)
+        ).fetchone()
+        return int(row["chapter_cap"]) if row else None
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
+def set_user_cap_override(user_id: int, cap: Optional[int]) -> None:
+    """cap=None removes the override; cap=0 means unlimited for this user."""
+    conn = local_db()
+    try:
+        if cap is None:
+            conn.execute("DELETE FROM user_limits WHERE user_id = ?", (int(user_id),))
+        else:
+            conn.execute(
+                """
+                INSERT INTO user_limits (user_id, chapter_cap) VALUES (?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    chapter_cap = excluded.chapter_cap,
+                    updated_at = datetime('now')
+                """,
+                (int(user_id), int(cap)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def log_action(
+    session_id: Optional[str],
+    task_id: Optional[int],
+    user_id: Optional[int],
+    username: str,
+    kind: str,
+    detail: str = "",
+) -> None:
+    try:
+        conn = local_db()
+        try:
+            conn.execute(
+                """
+                INSERT INTO user_actions
+                    (session_id, task_id, user_id, username, kind, detail)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (session_id, task_id, user_id, username or "", kind, (detail or "")[:500]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        print(f"[ACTION LOG ERROR] {error}")
+
+
+def get_chapter_cap(user_id: Optional[int] = None) -> int:
+    """
+    Max first-time network chapter fetches per 24h. With user_id, a per-user
+    override from /userlimit wins (0 = unlimited for that user).
+    """
+    if user_id is not None:
+        override = get_user_cap_override(user_id)
+        if override is not None:
+            return max(0, override)
+    return get_default_chapter_cap()
+
+
+def get_default_chapter_cap() -> int:
     """
     Max first-time network chapter fetches per user per 24h, UNIVERSAL
     across all novels (CHAPTER_CAP in .env). 0 = unlimited. Cache hits
@@ -533,7 +830,7 @@ def pulls_remaining(user_id: int, unlimited: bool = False) -> int:
     """
     if unlimited or is_admin(user_id):
         return 10**9
-    cap = get_chapter_cap()
+    cap = get_chapter_cap(user_id)
     if cap <= 0:
         return 10**9
     used = count_chapter_pulls(user_id, hours=24)
@@ -563,7 +860,7 @@ def daily_usage_summary(user_id: int) -> str:
     else:
         task_part = "unlimited tasks"
 
-    cap = get_chapter_cap()
+    cap = get_chapter_cap(user_id)
     if cap > 0 and not unlimited:
         remaining = pulls_remaining(user_id, unlimited)
         chapter_part = f"{remaining}/{cap} fresh chapter downloads"
@@ -1076,6 +1373,273 @@ def release_stale_chrome(reason: str = "") -> None:
 # Chrome via SeleniumBase UC Mode (headless by default)
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# One-time remote-solve link + activity log
+# ---------------------------------------------------------------------------
+
+_ACTIVITY_JS = r"""
+(function(){
+  try {
+    if (!window.__wtrAct) {
+      window.__wtrAct = [];
+      var push = function(t, d){ try { window.__wtrAct.push([t, String(d).slice(0, 120)]); } catch(e){} };
+      document.addEventListener('keydown', function(e){
+        var k = e.key || '';
+        var combo = (e.ctrlKey?'Ctrl+':'')+(e.altKey?'Alt+':'')+(e.shiftKey?'Shift+':'')+(e.metaKey?'Meta+':'')+k;
+        if (e.ctrlKey || e.altKey || e.metaKey || /^F\d+$/.test(k)) push('key', combo);
+      }, true);
+      document.addEventListener('click', function(e){
+        var t = e.target;
+        var el = (t && t.closest) ? (t.closest('a,button,input,select,textarea,[role=button]') || t) : t;
+        var label = '';
+        try { label = (el.innerText || el.value || el.getAttribute('aria-label') || el.id || '') + ''; } catch(x){}
+        push('click', (el && el.tagName ? el.tagName.toLowerCase() : '?') + ' "' + label.trim().slice(0, 60) + '"');
+      }, true);
+      document.addEventListener('contextmenu', function(){ push('rightclick', 'context menu'); }, true);
+    }
+    var nav = (performance.getEntriesByType('navigation') || [])[0];
+    var out = window.__wtrAct.splice(0, 50);
+    return {events: out, origin: performance.timeOrigin, navType: nav ? nav.type : ''};
+  } catch (e) { return {events: [], origin: 0, navType: ''}; }
+})();
+"""
+
+
+def _port_open(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def _strip_url(url: str) -> str:
+    """Scheme + host + path only (no query/fragment, which can hold tokens)."""
+    try:
+        parts = urllib.parse.urlsplit(url or "")
+        return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    except Exception:
+        return (url or "")[:200]
+
+
+class RemoteSolve:
+    """
+    A single-use link to the Chrome window: noVNC (websockify) behind a
+    cloudflared quick tunnel with a random trycloudflare.com address. The link
+    stops working when stop() kills the tunnel. While it is open, poll() logs
+    what the person does in the browser (tabs, navigation, refreshes, key
+    combos, clicks, DevTools, login screen, Chrome closing) to user_actions.
+    """
+
+    def __init__(self, browser, *, task_id, user_id, allowed_url: str, enforce: bool = True):
+        self.browser = browser
+        self.enforce = enforce
+        self.task_id = task_id
+        self.user_id = user_id
+        self.allowed_url = allowed_url
+        self.session_id = secrets.token_hex(4)
+        self.username = username_for(user_id)
+        self.procs: list = []
+        self.started_at = time.time()
+        self.expires_at: Optional[float] = (
+            self.started_at + REMOTE_LINK_MAX_MINUTES * 60
+            if REMOTE_LINK_MAX_MINUTES > 0
+            else None
+        )
+        self.stopped = False
+        self.event_count = 0
+        self.url: Optional[str] = None
+        self._last_url: Optional[str] = None
+        self._last_origin: Any = None
+        self._seen_targets: set = set()
+        self._login_flagged = False
+
+    # -- logging ----------------------------------------------------------
+    def log(self, kind: str, detail: str = "") -> None:
+        self.event_count += 1
+        log_action(self.session_id, self.task_id, self.user_id, self.username, kind, detail)
+
+    # -- lifecycle --------------------------------------------------------
+    def start(self) -> Optional[str]:
+        try:
+            cloudflared = shutil.which(CLOUDFLARED_BIN)
+            if not cloudflared:
+                print(f"[REMOTE] cloudflared not found ({CLOUDFLARED_BIN})")
+                return None
+            if not (Path(NOVNC_WEB_DIR) / "vnc.html").is_file():
+                print(f"[REMOTE] noVNC not found in {NOVNC_WEB_DIR} (set NOVNC_WEB_DIR)")
+                return None
+            if not _port_open(VNC_PORT):
+                print(f"[REMOTE] No VNC server listening on 127.0.0.1:{VNC_PORT}")
+                return None
+
+            if not _port_open(NOVNC_PORT):
+                websockify = shutil.which("websockify")
+                command = [websockify] if websockify else [sys.executable, "-m", "websockify"]
+                command += [
+                    "--web", NOVNC_WEB_DIR,
+                    f"127.0.0.1:{NOVNC_PORT}", f"127.0.0.1:{VNC_PORT}",
+                ]
+                proc = subprocess.Popen(
+                    command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                self.procs.append(proc)
+                time.sleep(1.5)
+                if proc.poll() is not None or not _port_open(NOVNC_PORT):
+                    print("[REMOTE] websockify failed to start")
+                    self.stop("websockify failed")
+                    return None
+
+            tunnel = subprocess.Popen(
+                [cloudflared, "tunnel", "--no-autoupdate", "--url",
+                 f"http://127.0.0.1:{NOVNC_PORT}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            self.procs.append(tunnel)
+            found: "queue.Queue[str]" = queue.Queue()
+
+            def reader():
+                try:
+                    for line in tunnel.stdout:
+                        match = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
+                        if match:
+                            found.put(match.group(0))
+                except Exception:
+                    pass
+
+            threading.Thread(target=reader, daemon=True).start()
+            base = found.get(timeout=30)
+        except Exception as error:
+            print(f"[REMOTE] could not start link: {type(error).__name__}: {error}")
+            self.stop("start failed")
+            return None
+
+        self.url = f"{base}/vnc.html?autoconnect=true&resize=scale&reconnect=true"
+        self._baseline()
+        self.log("session_start", "one-time link issued")
+        return self.url
+
+    def stop(self, reason: str) -> None:
+        if self.stopped:
+            return
+        self.stopped = True
+        for proc in reversed(self.procs):
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=4)
+                except Exception:
+                    proc.kill()
+            except Exception:
+                pass
+        self.procs.clear()
+        if self.url:
+            seconds = int(time.time() - self.started_at)
+            self.log("session_end", f"link closed ({reason}) after {seconds}s")
+            print(f"[REMOTE] link closed ({reason})")
+
+    def expired(self) -> bool:
+        return self.expires_at is not None and time.time() >= self.expires_at
+
+    # -- monitoring -------------------------------------------------------
+    def _baseline(self) -> None:
+        try:
+            self._last_url = _strip_url(self.browser.driver.current_url or "")
+        except Exception:
+            self._last_url = None
+        if ACTIVITY_DEEP:
+            try:
+                for target in self.browser._cdp("Target.getTargets", {}).get("targetInfos", []):
+                    self._seen_targets.add(target.get("targetId"))
+            except Exception:
+                pass
+
+    def _host_allowed(self, url: str) -> bool:
+        if url.startswith(("about:blank", "data:")):
+            return True
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+        return host.endswith("wtr-lab.com") or host.endswith("cloudflare.com")
+
+    def poll(self) -> None:
+        browser = self.browser
+        if not browser.is_alive():
+            self.log("chrome_closed", "Chrome window was closed or crashed")
+            raise DeadBrowser("Chrome closed during a remote-solve session")
+        driver = browser.driver
+
+        try:
+            handles = list(driver.window_handles)
+            if len(handles) > 1:
+                self.log(
+                    "new_tab",
+                    f"opened {len(handles) - 1} extra tab/window"
+                    + (" (closed)" if self.enforce else ""),
+                )
+                if self.enforce:
+                    browser._keep_one_tab()
+
+            current = driver.current_url or ""
+            clean = _strip_url(current)
+            if clean != self._last_url:
+                self._last_url = clean
+                self.log("navigated", clean)
+                if not self._host_allowed(current):
+                    self.log("off_site", f"left wtr-lab.com: {clean}")
+                    try:
+                        if not self.enforce:
+                            raise RuntimeError("admin session: not redirected")
+                        browser.open(self.allowed_url)
+                        self._last_url = _strip_url(self.allowed_url)
+                    except Exception as error:
+                        if is_dead_session(error):
+                            raise DeadBrowser(str(error)) from error
+
+            on_login = browser.is_login_page()
+            if on_login and not self._login_flagged:
+                self.log("login_screen", "page shows the login screen (possible logout)")
+            self._login_flagged = on_login
+
+            if ACTIVITY_DEEP:
+                result = driver.execute_script(_ACTIVITY_JS) or {}
+                for kind, detail in result.get("events", []):
+                    self.log(str(kind), str(detail))
+                origin = result.get("origin")
+                if self._last_origin is not None and origin != self._last_origin:
+                    if result.get("navType") == "reload":
+                        self.log("reload", "page refreshed")
+                    else:
+                        self.log("page_loaded", f"page loaded again ({result.get('navType') or 'navigate'})")
+                self._last_origin = origin
+
+                for target in browser._cdp("Target.getTargets", {}).get("targetInfos", []):
+                    target_id = target.get("targetId")
+                    if target_id in self._seen_targets:
+                        continue
+                    self._seen_targets.add(target_id)
+                    target_url = (target.get("url") or "")
+                    if target_url.startswith("devtools://"):
+                        self.log("devtools", "opened Chrome DevTools")
+                        try:
+                            if not self.enforce:
+                                raise RuntimeError("admin session: not closed")
+                            browser._cdp("Target.closeTarget", {"targetId": target_id})
+                        except Exception:
+                            pass
+                    elif target_url.startswith(("chrome://", "chrome-extension://", "view-source:")):
+                        self.log("internal_page", _strip_url(target_url)[:120])
+        except DeadBrowser:
+            raise
+        except Exception as error:
+            if is_dead_session(error):
+                self.log("chrome_closed", "Chrome window was closed or crashed")
+                raise DeadBrowser(str(error)) from error
+            print(f"[REMOTE] monitor error: {type(error).__name__}: {error}")
+
+
 class WtrBrowser:
     """
     Chrome via SeleniumBase UC Mode, tuned for low RAM.
@@ -1218,11 +1782,18 @@ class WtrBrowser:
         try:
             src = (self.html() or "").lower()
             title = (self.driver.get_title() or "").lower()
+            try:
+                url = (self.driver.current_url or "").lower()
+            except Exception:
+                url = ""
             return (
                 "continue with email" in src
                 or "welcome to wtr-lab" in src
                 or "sign in to continue" in src
                 or "login" in title and "wtr" in title
+                or "/login" in url
+                or "/signin" in url
+                or "/sign-in" in url
             )
         except Exception:
             return False
@@ -1509,6 +2080,31 @@ class WtrBrowser:
         """
         global captcha_wait
 
+        url = (novel_url or "").strip() or "https://wtr-lab.com/"
+
+        # Redirected to the login page = the account is logged out. That is
+        # NOT a captcha: wait for a re-login instead of retrying the API.
+        opened = False
+        try:
+            self.open(url)
+            opened = True
+        except Exception as error:
+            if is_dead_session(error):
+                raise DeadBrowser(str(error)) from error
+            print(f"[TURNSTILE] open failed: {error}")
+        if opened and self.is_login_page():
+            if not self.is_logged_in():  # confirm on the profile page
+                self.wait_for_login(
+                    url,
+                    reason,
+                    task_id=task_id,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    chapter_no=chapter_no,
+                )
+                return
+            opened = False  # false alarm; profile loaded, reopen the page below
+
         if HEADLESS:
             self._notify(
                 "turnstile_failed",
@@ -1520,7 +2116,6 @@ class WtrBrowser:
                 "Set HEADLESS=0 in .env, restart, and solve it over VNC."
             )
 
-        url = (novel_url or "").strip() or "https://wtr-lab.com/"
         print("\n" + "=" * 78)
         print("[WTR-LAB MANUAL TURNSTILE — NO AUTO-CLICK]")
         print(reason)
@@ -1529,12 +2124,13 @@ class WtrBrowser:
         print("(or wait up to 10 minutes for an automatic recheck).")
         print("=" * 78 + "\n")
 
-        try:
-            self.open(url)
-        except Exception as error:
-            if is_dead_session(error):
-                raise DeadBrowser(str(error)) from error
-            print(f"[TURNSTILE] open failed: {error}")
+        if not opened:
+            try:
+                self.open(url)
+            except Exception as error:
+                if is_dead_session(error):
+                    raise DeadBrowser(str(error)) from error
+                print(f"[TURNSTILE] open failed: {error}")
 
         try:
             self.driver.switch_to.window(self.driver.current_window_handle)
@@ -1586,71 +2182,275 @@ class WtrBrowser:
         )
         notify_admin("\n".join(admin_lines))
 
+        remote_enabled = bool(
+            REMOTE_SOLVE
+            and not HEADLESS
+            and chat_id is not None
+            and user_id is not None
+        )
+        remote: Optional[RemoteSolve] = None
+        remote_links = 0
+
+        def issue_link() -> Optional[RemoteSolve]:
+            nonlocal remote_links
+            remote_links += 1
+            is_admin_user = bool(user_id is not None and is_admin(int(user_id)))
+            session = RemoteSolve(
+                self,
+                task_id=task_id,
+                user_id=user_id,
+                allowed_url=url,
+                enforce=not is_admin_user,
+            )
+            link = session.start()
+            if not link:
+                notify_admin(
+                    "⚠️ Could not start the one-time solve link (see bot.log). "
+                    "Solve it over VNC, then send /solved."
+                )
+                return None
+            expiry_text = (
+                f"The link works once and closes after /solved "
+                f"(or after {REMOTE_LINK_MAX_MINUTES} minutes)."
+                if REMOTE_LINK_MAX_MINUTES > 0
+                else "The link works once and stays open until /solved is sent "
+                "or the download is cancelled."
+            )
+            if is_admin_user:
+                body = (
+                    "🛡️ <b>Cloudflare check needed</b>\n\n"
+                    f"🔗 <a href=\"{html.escape(link, quote=True)}\">Open the one-time link</a>\n"
+                    f"{html.escape(link)}\n\n"
+                    "1️⃣ Tick the Cloudflare checkbox.\n"
+                    "2️⃣ Send <b>/solved</b> here.\n\n"
+                    "Your activity in that window is logged (not restricted).\n\n"
+                    f"{expiry_text}"
+                )
+            else:
+                body = (
+                    "🛡️ <b>Cloudflare check needed</b>\n\n"
+                    "You can tick the checkbox yourself, or just wait and an "
+                    "admin will do it for you.\n\n"
+                    f"🔗 <a href=\"{html.escape(link, quote=True)}\">Open the one-time link</a>\n"
+                    f"{html.escape(link)}\n\n"
+                    "1️⃣ Tick the Cloudflare checkbox.\n"
+                    "2️⃣ Send <b>/solved</b> here.\n\n"
+                    "⚠️ <b>Everything you do in that window is logged</b> "
+                    "(refreshing, opening tabs or other sites, DevTools, "
+                    "logging out, closing Chrome) and reviewed by an admin. "
+                    "Only solve the Cloudflare check. Anything suspicious "
+                    "gets you banned from this bot.\n\n"
+                    f"{expiry_text}"
+                )
+            try:
+                send_notice(chat_id, body, user_id=user_id, parse_mode="HTML")
+            except Exception as error:
+                print(f"[REMOTE] could not send link: {error}")
+            if str(chat_id) != str(ADMIN_CHAT_ID):
+                notify_admin(
+                    f"🔗 One-time solve link sent to user <code>{user_id}</code> "
+                    f"(session <code>{session.session_id}</code>, task "
+                    f"<code>{task_id}</code>).\n{html.escape(link)}\n"
+                    "Review activity with /actions."
+                )
+            return session
+
+        if remote_enabled:
+            remote = issue_link()
+
         last_recheck = time.time()
-        while not stop_event.is_set():
-            if task_id is not None and is_cancelled(task_id):
-                captcha_wait = {}
-                solved_event.clear()
-                raise TaskCancelled()
-
-            # /solved or timed recheck
-            remaining = TURNSTILE_RECHECK_SECONDS - (time.time() - last_recheck)
-            wait_slice = max(1.0, min(15.0, remaining if remaining > 0 else 15.0))
-            if solved_event.wait(timeout=wait_slice):
-                print("[TURNSTILE] /solved received — checking page…")
-                solved_event.clear()
-                try:
-                    self.open(url)
-                    time.sleep(2)
-                    self._keep_one_tab()
-                except Exception as error:
-                    if is_dead_session(error):
-                        captcha_wait = {}
-                        raise DeadBrowser(str(error)) from error
-                    print(f"[TURNSTILE] reload after /solved: {error}")
-                if not self.page_looks_challenged():
-                    print("[TURNSTILE] Challenge cleared after /solved.")
+        try:
+            while not stop_event.is_set():
+                if task_id is not None and is_cancelled(task_id):
                     captcha_wait = {}
-                    self._notify("turnstile_cleared", "Captcha cleared — resuming.")
-                    return
-                print("[TURNSTILE] Still challenged after /solved — keep waiting.")
-                self._notify(
-                    "turnstile_waiting",
-                    "Still seeing the captcha after /solved. Leave Chrome on the "
-                    "challenge page, finish the checkbox, then /solved again.",
-                )
-                last_recheck = time.time()
-                continue
+                    solved_event.clear()
+                    raise TaskCancelled()
 
-            if time.time() - last_recheck >= TURNSTILE_RECHECK_SECONDS:
-                last_recheck = time.time()
-                print(
-                    f"[TURNSTILE] 10-min recheck — reloading {url}"
-                )
-                try:
-                    self.open(url)
-                    time.sleep(2)
-                    self._keep_one_tab()
-                except Exception as error:
-                    if is_dead_session(error):
+                # /solved or timed recheck
+                remaining = TURNSTILE_RECHECK_SECONDS - (time.time() - last_recheck)
+                wait_slice = max(1.0, min(15.0, remaining if remaining > 0 else 15.0))
+                if remote is not None:
+                    wait_slice = min(wait_slice, 2.0)
+                if solved_event.wait(timeout=wait_slice):
+                    print("[TURNSTILE] /solved received — checking page…")
+                    solved_event.clear()
+                    if remote is not None:
+                        remote.stop("user sent /solved")
+                        remote = None
+                    try:
+                        self.open(url)
+                        time.sleep(2)
+                        self._keep_one_tab()
+                    except Exception as error:
+                        if is_dead_session(error):
+                            captcha_wait = {}
+                            raise DeadBrowser(str(error)) from error
+                        print(f"[TURNSTILE] reload after /solved: {error}")
+                    if not self.page_looks_challenged():
+                        print("[TURNSTILE] Challenge cleared after /solved.")
                         captcha_wait = {}
-                        raise DeadBrowser(str(error)) from error
-                    print(f"[TURNSTILE] recheck open failed: {error}")
+                        self._notify("turnstile_cleared", "Captcha cleared — resuming.")
+                        return
+                    print("[TURNSTILE] Still challenged after /solved — keep waiting.")
+                    self._notify(
+                        "turnstile_waiting",
+                        "Still seeing the captcha after /solved. Finish the "
+                        "checkbox, then /solved again.",
+                    )
+                    last_recheck = time.time()
+                    if remote_enabled and remote_links < 3:
+                        remote = issue_link()  # fresh random link
                     continue
-                if not self.page_looks_challenged():
-                    print("[TURNSTILE] Challenge cleared on auto-recheck.")
-                    captcha_wait = {}
-                    self._notify("turnstile_cleared", "Captcha cleared — resuming.")
-                    return
-                print("[TURNSTILE] Still challenged on auto-recheck — waiting another 10 min.")
-                self._notify(
-                    "turnstile_waiting",
-                    "Still waiting on Cloudflare captcha (auto-recheck). "
-                    "Admin can send /solved after clearing it in Chrome.",
-                )
+
+                if remote is not None:
+                    remote.poll()
+                    if remote.expired():
+                        remote.stop("link expired")
+                        remote = None
+                        last_recheck = time.time()
+                        try:
+                            send_notice(
+                                chat_id,
+                                "⌛ The solve link expired. An admin will solve the "
+                                "Cloudflare check for you; no action needed.",
+                                user_id=user_id,
+                            )
+                        except Exception:
+                            pass
+                    continue  # no auto-reload while someone is solving
+
+                if time.time() - last_recheck >= TURNSTILE_RECHECK_SECONDS:
+                    last_recheck = time.time()
+                    print(
+                        f"[TURNSTILE] 10-min recheck — reloading {url}"
+                    )
+                    try:
+                        self.open(url)
+                        time.sleep(2)
+                        self._keep_one_tab()
+                    except Exception as error:
+                        if is_dead_session(error):
+                            captcha_wait = {}
+                            raise DeadBrowser(str(error)) from error
+                        print(f"[TURNSTILE] recheck open failed: {error}")
+                        continue
+                    if not self.page_looks_challenged():
+                        print("[TURNSTILE] Challenge cleared on auto-recheck.")
+                        captcha_wait = {}
+                        self._notify("turnstile_cleared", "Captcha cleared — resuming.")
+                        return
+                    print("[TURNSTILE] Still challenged on auto-recheck — waiting another 10 min.")
+                    self._notify(
+                        "turnstile_waiting",
+                        "Still waiting on Cloudflare captcha (auto-recheck). "
+                        "Admin can send /solved after clearing it in Chrome.",
+                    )
+        finally:
+            if remote is not None:
+                remote.stop("download resumed or ended")
 
         captcha_wait = {}
         raise TaskCancelled()
+
+    def wait_for_login(
+        self,
+        url: str,
+        reason: str,
+        *,
+        task_id: Optional[int] = None,
+        chat_id: Optional[int] = None,
+        user_id: Optional[int] = None,
+        chapter_no: Optional[int] = None,
+    ):
+        """
+        The shared WTR-Lab account is logged out. Do not retry the API (that
+        hammers the site and burns attempts). Tell the admin and the task's
+        user once, then wait here for a re-login: a /login magic link (run on
+        this worker thread) or someone logging in through the Chrome window.
+        """
+        global login_wait, session_state
+        session_state = "logged_out"
+        login_wait = {
+            "task_id": task_id,
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "since": time.time(),
+        }
+        chapter_bit = f" (chapter {chapter_no})" if chapter_no is not None else ""
+        print(f"[LOGIN] WTR-Lab account is logged out{chapter_bit}. {reason}")
+        self._notify(
+            "login_required",
+            "WTR-Lab account on the server is logged out. Waiting for /login.",
+        )
+        admin_lines = [
+            "🔐 <b>WTR-Lab account logged out</b>",
+            f"📌 {html.escape(reason[:300])}",
+            "The crawler is paused (not a captcha). Send <b>/login</b>, then "
+            "your email and the magic link, or log in through the Chrome window.",
+        ]
+        if task_id is not None:
+            admin_lines.append(f"🆔 Task: <code>{task_id}</code>")
+        if user_id is not None:
+            admin_lines.append(f"👤 User: <code>{user_id}</code>")
+        notify_admin("\n".join(admin_lines))
+        if chat_id is not None:
+            try:
+                send_notice(
+                    chat_id,
+                    (
+                        "🔐 <b>WTR-Lab login needed</b>\n\n"
+                        "The server's WTR-Lab account is logged out, so the "
+                        "download is paused (progress is saved).\n"
+                        "Send /login and then your email address to log it back "
+                        "in. The download resumes by itself afterwards."
+                    ),
+                    user_id=user_id,
+                    parse_mode="HTML",
+                )
+            except Exception as error:
+                print(f"[LOGIN] notice failed: {error}")
+        if user_id is not None:
+            pending_download[user_id] = {"step": "login_email", "from_task": task_id}
+
+        last_check = time.time()
+        try:
+            while not stop_event.is_set():
+                if task_id is not None and is_cancelled(task_id):
+                    raise TaskCancelled()
+                if not self.is_alive():
+                    raise DeadBrowser("Chrome died while waiting for login")
+                try:
+                    request = login_requests.get(timeout=5)
+                except queue.Empty:
+                    request = None
+                if request is not None:
+                    do_magic_login(
+                        request["chat_id"],
+                        request["user_id"],
+                        request["email"],
+                        browser=self,
+                    )
+                    last_check = 0.0  # verify right away
+                if time.time() - last_check >= LOGIN_RECHECK_SECONDS:
+                    last_check = time.time()
+                    if self.is_logged_in():
+                        session_state = "ok"
+                        print("[LOGIN] Logged in again — resuming.")
+                        self._notify("login_ok", "Logged in again — resuming.")
+                        notify_admin("✅ WTR-Lab is logged in again. Crawler resuming.")
+                        if chat_id is not None:
+                            send_notice(
+                                chat_id,
+                                "✅ WTR-Lab is logged in again — resuming your download.",
+                                user_id=user_id,
+                            )
+                        state = pending_download.get(user_id) if user_id is not None else None
+                        if state and str(state.get("step", "")).startswith("login"):
+                            pending_download.pop(user_id, None)
+                        return
+            raise TaskCancelled()
+        finally:
+            login_wait = {}
 
 
 # ---------------------------------------------------------------------------
@@ -1668,7 +2468,7 @@ def do_magic_login(
     Drive the shared Chrome profile through WTR-Lab magic-link login.
     The user pastes the magic link back into Telegram; we open it in Chrome.
     """
-    global current_login_user
+    global current_login_user, session_state
     owned = browser is None
     try:
         with login_lock:
@@ -1681,6 +2481,7 @@ def do_magic_login(
         time.sleep(2)
 
         if not browser.is_login_page():
+            session_state = "ok"
             send_notice(
                 chat_id,
                 "✅ Already logged in on this Chrome profile.",
@@ -1753,6 +2554,7 @@ def do_magic_login(
             )
             return False
 
+        session_state = "ok"
         send_notice(
             chat_id,
             (
@@ -2605,6 +3407,27 @@ class WtrLabClient:
                 )
                 continue
 
+            # Login-style rejection (not a captcha): wait for a re-login
+            # instead of failing the chapter or retrying blindly.
+            login_text = (
+                str(response.get("message") or response.get("error") or "").lower()
+                if isinstance(response, dict)
+                else ""
+            )
+            if any(
+                marker in login_text
+                for marker in ("log in", "login", "sign in", "unauthorized", "unauthenticated")
+            ):
+                self.browser.wait_for_login(
+                    self.chapter_open_url(novel, chapter),
+                    f"Chapter {chapter.order}: site asked for login ({login_text[:80]})",
+                    task_id=task_id if task_id is not None else self.task_id,
+                    chat_id=chat_id if chat_id is not None else self.chat_id,
+                    user_id=user_id if user_id is not None else self.user_id,
+                    chapter_no=chapter.order,
+                )
+                continue
+
             # Non-turnstile / non-timeout failure — stop retrying
             break
 
@@ -2624,6 +3447,9 @@ class WtrLabClient:
                 else str(response)
             )
             raise WtrError(f"Chapter {chapter.order} failed: {message}")
+
+        global session_state
+        session_state = "ok"
 
         data, raw_body = locate_chapter_body(response)
 
@@ -3842,6 +4668,7 @@ def write_novel_metadata(novel: NovelInfo, novel_dir: Path):
 
 
 def process_task(task: dict, browser: WtrBrowser):
+    global session_state
     task_id = task["id"]
     chat_id = task["chat_id"]
     novel = None
@@ -3887,6 +4714,21 @@ def process_task(task: dict, browser: WtrBrowser):
                     "✅ Captcha cleared — resuming download…\n\n"
                     f"{detail or ''}"
                 ),
+            )
+        elif kind == "login_required":
+            edit_progress(
+                progress,
+                (
+                    f"📖 {title}\n\n"
+                    "🔐 WTR-Lab account on the server is logged out — paused.\n\n"
+                    "Send /login to log it back in. Progress is saved and the "
+                    "download resumes automatically."
+                ),
+            )
+        elif kind == "login_ok":
+            edit_progress(
+                progress,
+                f"📖 {title}\n\n✅ Logged in again — resuming download…",
             )
         elif kind == "origin_timeout":
             edit_progress(
@@ -3941,23 +4783,16 @@ def process_task(task: dict, browser: WtrBrowser):
     try:
         # Shared Chrome profile must be logged in for chapter API access.
         if not browser.is_logged_in():
-            send_notice(
-                chat_id,
-                (
-                    "🔐 <b>Login required</b>\n\n"
-                    "The shared Chrome profile is logged out.\n"
-                    "Please send your email address now to start magic-link login.\n"
-                    "(WTR-Lab accounts are free)"
-                ),
+            # Wait here (notifies admin + user once); no requeue / re-check loop.
+            browser.wait_for_login(
+                "https://wtr-lab.com/en/profile",
+                "Logged out when the task started",
+                task_id=task_id,
+                chat_id=chat_id,
                 user_id=task.get("user_id"),
-                parse_mode="HTML",
             )
-            pending_download[task["user_id"]] = {
-                "step": "login_email",
-                "from_task": task_id,
-            }
-            requeue_task(task_id)
-            return
+        else:
+            session_state = "ok"
 
         client = WtrLabClient(browser)
         client.task_id = task_id
@@ -4000,7 +4835,7 @@ def process_task(task: dict, browser: WtrBrowser):
 
         user_id = int(task["user_id"])
         unlimited_pulls = is_admin(user_id)
-        daily_cap = get_chapter_cap()
+        daily_cap = get_chapter_cap(user_id)
 
         # Only fetch chapters that are missing/empty (gap-only).
         to_fetch = [
@@ -4271,13 +5106,26 @@ def process_task(task: dict, browser: WtrBrowser):
         send_partial_if_possible(
             "⚠️ Chrome closed or the session died.\n"
             "Sending any chapters already cached.\n\n"
-            "📌 Resend the same link (or /continue) to resume. "
-            "The worker will reopen Chrome and continue from cache."
+            "The worker is reopening Chrome and will resume this download "
+            "automatically from cache."
         )
         mark_failed(task_id, "Chrome session died")
         raise
 
     except Exception as error:
+        if is_dead_session(error):
+            # Same as DeadBrowser: Chrome died outside a wrapped call. Resume
+            # automatically instead of leaving the task failed.
+            print(f"[DEAD BROWSER] Task {task_id}: {type(error).__name__}: {error}")
+            send_partial_if_possible(
+                "⚠️ Chrome closed or the session died.\n"
+                "Sending any chapters already cached.\n\n"
+                "The worker is reopening Chrome and will resume this download "
+                "automatically from cache."
+            )
+            mark_failed(task_id, "Chrome session died")
+            raise DeadBrowser(str(error)) from error
+
         print(f"[WTR TASK ERROR] task={task_id}: {type(error).__name__}: {error}")
         reason = user_facing_error(error)
 
@@ -4317,6 +5165,17 @@ def process_task(task: dict, browser: WtrBrowser):
 
 def deny_if_needed(message) -> bool:
     uid = message.from_user.id
+    ban = None if is_admin(uid) else get_ban(uid)
+    if ban:
+        until = ban["until"]
+        reply_notice(
+            message,
+            "🚫 You are banned from using this bot"
+            + (f" until {until} UTC." if until else " permanently.")
+            + (f"\nReason: {ban['reason']}" if ban["reason"] else "")
+            + "\nContact the admin if you think this is a mistake.",
+        )
+        return True
     if user_allowed(uid):
         return False
     reply_notice(
@@ -4331,7 +5190,7 @@ def deny_if_needed(message) -> bool:
 def cmd_start(message):
     if deny_if_needed(message):
         return
-    cap = get_chapter_cap()
+    cap = get_chapter_cap(message.from_user.id)
     limit_line = (
         f"• Daily task limit: {DAILY_TASK_LIMIT}\n"
         if DAILY_TASK_LIMIT > 0
@@ -4382,6 +5241,14 @@ def cmd_start(message):
 @bot.message_handler(commands=["login"])
 def cmd_login(message):
     if deny_if_needed(message):
+        return
+    if session_state == "ok" and not login_wait:
+        reply_notice(
+            message,
+            "✅ The server's WTR-Lab account is already logged in, so /login "
+            "isn't needed. If it gets logged out, the bot will pause, tell the "
+            "admin and ask for a login.",
+        )
         return
     pending_download[message.from_user.id] = {"step": "login_email"}
     reply_notice(
@@ -4583,6 +5450,186 @@ def cmd_continue(message):
         conn.close()
 
 
+def _admin_only(message) -> bool:
+    if is_admin(message.from_user.id):
+        return True
+    reply_notice(message, "⛔ Admins only.")
+    return False
+
+
+def _user_label(user_id: int) -> str:
+    name = username_for(user_id)
+    return f"{user_id}" + (f" (@{name})" if name else "")
+
+
+@bot.message_handler(commands=["banuser"])
+def cmd_banuser(message):
+    """/banuser <user_id|@username> [days] [reason...] — no days = forever."""
+    if not _admin_only(message):
+        return
+    args = [a for a in (message.text or "").split()[1:] if a != "-"]
+    if not args:
+        reply_notice(
+            message,
+            "Usage:\n/banuser <user_id|@username>  — permanent ban\n"
+            "/banuser <user_id|@username> 7  — 7-day ban",
+        )
+        return
+    uid = resolve_user_ref(args[0])
+    if uid is None:
+        reply_notice(
+            message,
+            "❓ I don't know that user. Use their numeric ID, or an @username "
+            "they have used the bot with.",
+        )
+        return
+    if is_admin(uid):
+        reply_notice(message, "⛔ Admins can't be banned.")
+        return
+    days = None
+    rest = args[1:]
+    if rest and rest[0].isdigit():
+        days = int(rest[0])
+        rest = rest[1:]
+        if days <= 0:
+            reply_notice(message, "Days must be 1 or more (leave it out for a permanent ban).")
+            return
+    reason = " ".join(rest)[:200]
+    until = ban_user(uid, days, message.from_user.id, reason)
+    cancelled = cancel_user_tasks(uid)
+    pending_download.pop(uid, None)
+    log_action(None, None, uid, username_for(uid), "banned",
+               f"by {message.from_user.id}; until={until or 'forever'}; {reason}")
+    try:
+        bot.send_message(
+            uid,
+            "🚫 You have been banned from using this bot"
+            + (f" until {until} UTC." if until else " permanently.")
+            + (f"\nReason: {reason}" if reason else ""),
+        )
+    except Exception:
+        pass
+    reply_notice(
+        message,
+        f"🚫 Banned {_user_label(uid)} "
+        + (f"until {until} UTC" if until else "permanently")
+        + f". Cancelled {cancelled} active task(s).",
+    )
+
+
+@bot.message_handler(commands=["unbanuser"])
+def cmd_unbanuser(message):
+    if not _admin_only(message):
+        return
+    args = [a for a in (message.text or "").split()[1:] if a != "-"]
+    if not args:
+        reply_notice(message, "Usage: /unbanuser <user_id|@username>")
+        return
+    uid = resolve_user_ref(args[0])
+    if uid is None:
+        reply_notice(message, "❓ I don't know that user.")
+        return
+    if unban_user(uid):
+        log_action(None, None, uid, username_for(uid), "unbanned", f"by {message.from_user.id}")
+        try:
+            bot.send_message(uid, "✅ Your ban has been lifted. You can use the bot again.")
+        except Exception:
+            pass
+        reply_notice(message, f"✅ Unbanned {_user_label(uid)}.")
+    else:
+        reply_notice(message, f"ℹ️ {_user_label(uid)} was not banned.")
+
+
+@bot.message_handler(commands=["userlimit"])
+def cmd_userlimit(message):
+    """/userlimit <user_id|@username> <number|off|default> — daily fresh-chapter cap."""
+    if not _admin_only(message):
+        return
+    args = [a for a in (message.text or "").split()[1:] if a != "-"]
+    if len(args) < 2:
+        reply_notice(
+            message,
+            "Usage: /userlimit <user_id|@username> <number|off|default>\n"
+            "• number — custom daily fresh-chapter cap for that user\n"
+            "• off — no chapter cap for that user\n"
+            "• default — back to the server default",
+        )
+        return
+    uid = resolve_user_ref(args[0])
+    if uid is None:
+        reply_notice(message, "❓ I don't know that user.")
+        return
+    value = args[1].lower()
+    if value in ("off", "unlimited", "0"):
+        set_user_cap_override(uid, 0)
+        text = f"♾ {_user_label(uid)}: no daily chapter cap."
+    elif value in ("default", "reset"):
+        set_user_cap_override(uid, None)
+        default_cap = get_default_chapter_cap()
+        text = (
+            f"↩️ {_user_label(uid)}: back to the default "
+            f"({'unlimited' if default_cap <= 0 else str(default_cap) + ' chapters/day'})."
+        )
+    elif value.isdigit() and int(value) > 0:
+        set_user_cap_override(uid, int(value))
+        text = f"✅ {_user_label(uid)}: daily fresh-chapter cap is now {int(value)}."
+    else:
+        reply_notice(message, "Use a number, `off`, or `default`.")
+        return
+    log_action(None, None, uid, username_for(uid), "userlimit", f"{value} by {message.from_user.id}")
+    reply_notice(message, text)
+
+
+@bot.message_handler(commands=["actions"])
+def cmd_actions(message):
+    """/actions [user_id|@username] [count] — what users did in the remote Chrome."""
+    if not _admin_only(message):
+        return
+    limit = 60
+    uid = None
+    for arg in (message.text or "").split()[1:]:
+        if arg.isdigit() and len(arg) <= 3:
+            limit = max(1, min(int(arg), 300))
+        else:
+            uid = resolve_user_ref(arg)
+            if uid is None:
+                reply_notice(message, "❓ I don't know that user.")
+                return
+    conn = local_db()
+    try:
+        if uid is None:
+            rows = conn.execute(
+                "SELECT ts, session_id, task_id, user_id, username, kind, detail "
+                "FROM user_actions ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT ts, session_id, task_id, user_id, username, kind, detail "
+                "FROM user_actions WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+                (uid, limit),
+            ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        reply_notice(message, "ℹ️ No logged actions yet.")
+        return
+    lines = ["📋 User actions (UTC, oldest first)"]
+    last_session = object()
+    for row in reversed(rows):
+        if row["session_id"] != last_session:
+            last_session = row["session_id"]
+            who = f"{row['user_id']}" + (f" @{row['username']}" if row["username"] else "")
+            lines.append("")
+            lines.append(
+                f"— session {row['session_id'] or '-'} · user {who} · task {row['task_id'] or '-'}"
+            )
+        lines.append(f"{(row['ts'] or '')[5:19]}  {row['kind']}: {row['detail'] or ''}")
+    lines.append("")
+    lines.append("Note: a 'reload' right after the checkbox is normal (Cloudflare reloads the page).")
+    _send_long_text(message.chat.id, "\n".join(lines), user_id=message.from_user.id)
+
+
 @bot.message_handler(commands=["solved"])
 def cmd_solved(message):
     """
@@ -4600,6 +5647,14 @@ def cmd_solved(message):
         )
         return
     ctx = dict(captcha_wait)
+    owner = ctx.get("user_id")
+    sender = message.from_user.id
+    if owner is not None and sender != owner and not is_admin(sender):
+        reply_notice(
+            message,
+            "ℹ️ Only the user whose download is blocked (or an admin) can send /solved.",
+        )
+        return
     solved_event.set()
     detail = ""
     if ctx.get("chapter_no") is not None:
@@ -4723,7 +5778,7 @@ def cmd_cap(message):
         return
     uid = message.from_user.id
     unlimited = is_admin(uid)
-    cap = get_chapter_cap()
+    cap = get_chapter_cap(uid)
 
     if cap <= 0:
         chapter_block = (
@@ -4845,11 +5900,11 @@ def on_text(message):
             f"⏳ Starting magic-link login for <code>{html.escape(email)}</code>…",
             parse_mode="HTML",
         )
-        threading.Thread(
-            target=do_magic_login,
-            args=(message.chat.id, uid, email),
-            daemon=True,
-        ).start()
+        # The worker thread runs the login on the existing Chrome. Starting a
+        # second Chrome on the same profile kills the one that is crawling.
+        login_requests.put(
+            {"chat_id": message.chat.id, "user_id": uid, "email": email}
+        )
         return
 
     if state.get("step") == "login_waiting_link":
@@ -4982,6 +6037,49 @@ def on_range_choice(call):
 # Worker loop + bot polling
 # ---------------------------------------------------------------------------
 
+MAX_CRASH_RESUMES = 3
+_crash_counts: dict[int, int] = {}
+
+
+def resume_after_crash(task: dict, error: BaseException) -> None:
+    """Requeue a task whose Chrome died, at most MAX_CRASH_RESUMES times."""
+    task_id = int(task["id"])
+    count = _crash_counts.get(task_id, 0) + 1
+    _crash_counts[task_id] = count
+    if count <= MAX_CRASH_RESUMES:
+        print(f"[BROWSER] Resuming task #{task_id} after crash ({count}/{MAX_CRASH_RESUMES})")
+        requeue_task(task_id)
+        return
+    print(f"[BROWSER] Task #{task_id} crashed {count} times — leaving it failed.")
+    try:
+        send_notice(
+            task["chat_id"],
+            (
+                "⚠️ Chrome keeps crashing on this download, so I stopped "
+                "retrying automatically.\nCached chapters are safe. Send "
+                "/continue to try again."
+            ),
+            user_id=task.get("user_id"),
+        )
+    except Exception:
+        pass
+
+
+def drain_login_requests(browser: "WtrBrowser") -> None:
+    """Run queued /login requests on the worker thread (the only Chrome driver)."""
+    while True:
+        try:
+            request = login_requests.get_nowait()
+        except queue.Empty:
+            return
+        do_magic_login(
+            request["chat_id"],
+            request["user_id"],
+            request["email"],
+            browser=browser,
+        )
+
+
 def worker_loop():
     recover_interrupted_tasks()
     purge_old_finished_tasks(days=7)
@@ -5017,15 +6115,17 @@ def worker_loop():
 
             task = claim_task()
             if not task:
+                drain_login_requests(browser)
                 time.sleep(3)
                 continue
 
             print(f"[TASK] #{task['id']}: {task['url']} range={task['chapter_range']}")
             try:
                 process_task(task, browser)
+                _crash_counts.pop(int(task["id"]), None)
             except DeadBrowser as error:
                 print(f"[BROWSER] Dead during task #{task['id']}: {error}")
-                requeue_task(task["id"])
+                resume_after_crash(task, error)
                 browser.recreate(str(error))
             except (
                 InvalidSessionIdException,
@@ -5034,7 +6134,7 @@ def worker_loop():
             ) as error:
                 if is_dead_session(error):
                     print(f"[BROWSER] Session error #{task['id']}: {error}")
-                    requeue_task(task["id"])
+                    resume_after_crash(task, error)
                     browser.recreate(str(error))
                 else:
                     mark_failed(task["id"], str(error))
