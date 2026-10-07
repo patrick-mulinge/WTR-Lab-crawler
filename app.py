@@ -1476,6 +1476,7 @@ class RemoteSolve:
 
             if not _port_open(NOVNC_PORT):
                 # Always use the same Python that is running the bot (venv).
+                # Log to a temp file so we never block on a live stdout pipe.
                 command = [
                     sys.executable, "-m", "websockify",
                     "--web", NOVNC_WEB_DIR,
@@ -1483,28 +1484,52 @@ class RemoteSolve:
                     f"127.0.0.1:{VNC_PORT}",
                 ]
                 print(f"[REMOTE] starting websockify: {' '.join(command)}")
+                log_path = DATA_DIR / f"websockify-{os.getpid()}.log"
+                try:
+                    log_fh = open(log_path, "w", encoding="utf-8")
+                except Exception:
+                    log_fh = subprocess.DEVNULL
+                    log_path = None
                 proc = subprocess.Popen(
                     command,
-                    stdout=subprocess.PIPE,
+                    stdout=log_fh,
                     stderr=subprocess.STDOUT,
-                    text=True,
                 )
                 self.procs.append(proc)
-                time.sleep(2.0)
-                if proc.poll() is not None or not _port_open(NOVNC_PORT):
+                # Give it a few chances to bind the port.
+                ready = False
+                for _ in range(8):
+                    time.sleep(0.5)
+                    if proc.poll() is not None:
+                        break
+                    if _port_open(NOVNC_PORT):
+                        ready = True
+                        break
+                if not ready:
                     out = ""
-                    try:
-                        out = (proc.stdout.read() or "")[-2000:] if proc.stdout else ""
-                    except Exception:
-                        pass
+                    if log_path and log_path.is_file():
+                        try:
+                            out = log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+                        except Exception:
+                            pass
                     print(
                         f"[REMOTE] websockify failed to start "
                         f"(exit={proc.poll()}, port_open={_port_open(NOVNC_PORT)})\n"
                         f"{out or '(no output)'}"
                     )
+                    try:
+                        if log_fh is not subprocess.DEVNULL:
+                            log_fh.close()
+                    except Exception:
+                        pass
                     self.stop("websockify failed")
                     return None
                 print(f"[REMOTE] websockify listening on 127.0.0.1:{NOVNC_PORT}")
+                try:
+                    if log_fh is not subprocess.DEVNULL:
+                        log_fh.close()
+                except Exception:
+                    pass
 
             tunnel = subprocess.Popen(
                 [cloudflared, "tunnel", "--no-autoupdate", "--url",
