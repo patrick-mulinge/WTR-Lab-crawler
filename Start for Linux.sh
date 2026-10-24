@@ -1,25 +1,18 @@
 #!/usr/bin/env bash
-# WTR-Lab local worker — Oracle Linux / RHEL / Rocky / Alma (dnf only)
+# WTR-Lab Start — Oracle Linux / RHEL / Rocky / Alma (dnf)
+# Supports x86_64 and aarch64.
 #
 # Usage:
 #   chmod +x "Start for Linux.sh"
 #   ./"Start for Linux.sh"
 #
-# Supported:
-#   - Oracle Linux 8/9 (dnf)
-#   - RHEL / Rocky / Alma / CentOS Stream (dnf)
+# Run WITHOUT sudo (script asks for sudo only for packages).
 #
-# IMPORTANT:
-#   Run this script WITHOUT sudo.
-#   It will request sudo only when installing system packages.
+# One-time .env setup: BOT_TOKEN, SERVER_ID, DATABASE_URL, limits, etc.
+# Later changes: edit .env or use the bot /set command — this script will
+# NOT re-prompt for values already set in .env.
 #
-# Non-interactive / headless VPS:
-#   Export BOT_TOKEN (and optional settings) before running, or pre-create .env.
-#   Example:
-#     export BOT_TOKEN="123456:ABC..."
-#     export ALLOWED_USER_IDS="111111111"
-#     export HEADLESS=1
-#     ./"Start for Linux.sh"
+# After data/.setup_done exists: skip installs; only ensure services + start app.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -29,11 +22,15 @@ ENV_FILE="./.env"
 REQ_FILE="./requirements.txt"
 APP_FILE="./app.py"
 MARKER="./data/.setup_done"
-
-# Optional GitHub zip URL if the project folder is incomplete.
-GITHUB_ZIP_URL="https://github.com/patrick-mulinge/WTR-Lab-crawler/archive/refs/heads/seleniumbase.zip"
+NOVNC_DIR="${HOME}/noVNC"
+CLOUDFLARED_BIN_PATH="${HOME}/bin/cloudflared"
+DISPLAY_NUM=99
+VNC_PORT=5901
+NOVNC_PORT=6080
+GITHUB_ZIP_URL="${GITHUB_ZIP_URL:-https://github.com/patrick-mulinge/WTR-Lab-crawler/archive/refs/heads/seleniumbase.zip}"
 
 IS_INTERACTIVE=0
+ARCH="$(uname -m)"
 
 info()  { echo "[*] $*"; }
 ok()    { echo "[+] $*"; }
@@ -41,16 +38,8 @@ warn()  { echo "[!] $*"; }
 err()   { echo "[x] $*" >&2; }
 
 
-# =========================================================
-# INTERACTIVE / TTY DETECTION
-# =========================================================
-
 detect_interactive() {
-  if [[ -t 0 ]] && [[ -t 1 ]]; then
-    IS_INTERACTIVE=1
-  else
-    IS_INTERACTIVE=0
-  fi
+  if [[ -t 0 ]] && [[ -t 1 ]]; then IS_INTERACTIVE=1; else IS_INTERACTIVE=0; fi
 }
 
 
@@ -59,12 +48,10 @@ prompt_or_env() {
   local prompt="$2"
   local default="${3-}"
   local current="${!var-}"
-
   if [[ -n "$current" ]]; then
     printf -v "$var" '%s' "$current"
     return
   fi
-
   if [[ "$IS_INTERACTIVE" -eq 1 ]]; then
     local answer=""
     if [[ -n "$default" ]]; then
@@ -80,33 +67,30 @@ prompt_or_env() {
 }
 
 
-require_token_noninteractive() {
-  if [[ "$IS_INTERACTIVE" -eq 1 ]]; then
-    return
-  fi
-  if [[ -f "$ENV_FILE" ]] && grep -qE '^BOT_TOKEN=.+' "$ENV_FILE" \
-      && ! grep -q 'your_token_here' "$ENV_FILE"; then
-    return
-  fi
-  if [[ -n "${BOT_TOKEN:-}" ]]; then
-    return
-  fi
-  err "Non-interactive session (no TTY) and BOT_TOKEN is not set."
-  err "Either:"
-  err "  1) export BOT_TOKEN='your_token_from_BotFather'"
-  err "  2) create .env with BOT_TOKEN=... before running"
-  err "  3) run this script from an interactive SSH session"
-  exit 1
+dotenv_get() {
+  local key="$1"
+  [[ -f "$ENV_FILE" ]] || return 0
+  grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true
 }
 
 
-# =========================================================
-# PROJECT CHECK
-# =========================================================
-
-project_ok() {
-  [[ -f "$APP_FILE" && -f "$REQ_FILE" ]]
+dotenv_set() {
+  local key="$1"
+  local value="$2"
+  local tmp
+  tmp="$(mktemp)"
+  touch "$ENV_FILE"
+  if grep -qE "^${key}=" "$ENV_FILE" 2>/dev/null; then
+    sed -E "s|^${key}=.*|${key}=${value}|" "$ENV_FILE" >"$tmp"
+    mv "$tmp" "$ENV_FILE"
+  else
+    echo "${key}=${value}" >>"$ENV_FILE"
+    rm -f "$tmp"
+  fi
 }
+
+
+project_ok() { [[ -f "$APP_FILE" && -f "$REQ_FILE" ]]; }
 
 
 ensure_project() {
@@ -114,223 +98,244 @@ ensure_project() {
     ok "Project files found."
     return
   fi
-
-  warn "app.py or requirements.txt is missing."
-
-  if [[ -z "$GITHUB_ZIP_URL" ]]; then
-    err "No GitHub URL configured."
-    err "Copy the complete project folder here and run again."
-    exit 1
-  fi
-
-  info "Downloading project from GitHub..."
-
+  warn "app.py or requirements.txt missing — downloading..."
+  [[ -n "$GITHUB_ZIP_URL" ]] || { err "No GITHUB_ZIP_URL"; exit 1; }
+  local tmpzip tmpdir inner
   tmpzip="$(mktemp)"
   tmpdir="$(mktemp -d)"
-
-  cleanup_project() {
-    rm -rf "$tmpzip" "$tmpdir"
-  }
-  trap cleanup_project EXIT
-
   curl -fsSL "$GITHUB_ZIP_URL" -o "$tmpzip"
   unzip -q "$tmpzip" -d "$tmpdir"
-
   inner="$(find "$tmpdir" -mindepth 1 -maxdepth 1 -type d | head -1)"
-  if [[ -z "$inner" ]]; then
-    err "Downloaded archive is empty or invalid."
-    exit 1
-  fi
-
+  [[ -n "$inner" ]] || { err "Empty archive"; exit 1; }
   cp -R "$inner"/* .
-
-  if ! project_ok; then
-    err "Download incomplete. app.py or requirements.txt is still missing."
-    exit 1
-  fi
-
-  trap - EXIT
-  cleanup_project
-  ok "Project files downloaded."
+  rm -rf "$tmpzip" "$tmpdir"
+  project_ok || { err "Download incomplete"; exit 1; }
+  ok "Project downloaded."
 }
 
-
-# =========================================================
-# OPERATING SYSTEM CHECK (dnf only)
-# =========================================================
 
 detect_os() {
-  if [[ ! -f /etc/os-release ]]; then
-    err "Cannot determine Linux distribution (/etc/os-release missing)."
-    exit 1
-  fi
-
+  [[ -f /etc/os-release ]] || { err "No /etc/os-release"; exit 1; }
   # shellcheck disable=SC1091
   source /etc/os-release
-
-  if ! command -v dnf >/dev/null 2>&1; then
-    err "This script requires dnf (Oracle Linux / RHEL / Rocky / Alma)."
-    err "Detected package manager is missing or not dnf."
-    exit 1
-  fi
-
-  ok "OS: ${PRETTY_NAME:-$ID}  (dnf)"
+  command -v dnf >/dev/null 2>&1 || { err "dnf required"; exit 1; }
+  ok "OS: ${PRETTY_NAME:-$ID}  arch=$ARCH"
 }
 
-
-# =========================================================
-# SUDO
-# =========================================================
 
 ensure_sudo() {
   if [[ $EUID -eq 0 ]]; then
-    warn "Do not run this script with sudo / as root."
-    echo
-    echo "Run it normally as a regular user:"
-    echo
-    echo '  ./"Start for Linux.sh"'
-    echo
-    warn "The script will request sudo only when installing packages."
+    err "Do not run as root. Use: ./\"Start for Linux.sh\""
     exit 1
   fi
-
-  if ! command -v sudo >/dev/null 2>&1; then
-    err "sudo is required to install system packages."
-    exit 1
-  fi
-
-  info "Checking sudo access..."
+  command -v sudo >/dev/null 2>&1 || { err "sudo required"; exit 1; }
   sudo -v
-  ok "sudo access confirmed."
+  ok "sudo OK."
 }
 
 
-# =========================================================
-# PACKAGE INSTALLERS (dnf only)
-# =========================================================
-
-PKG_UPDATED=0
-
-pkg_installed() {
-  rpm -q "$1" >/dev/null 2>&1
-}
+pkg_installed() { rpm -q "$1" >/dev/null 2>&1; }
 
 
-pkg_install() {
-  local packages=("$@")
-  local missing=()
-
-  for package in "${packages[@]}"; do
-    if pkg_installed "$package"; then
-      ok "$package already installed."
+# Install packages one-by-one so a missing name never blocks the rest
+pkg_install_each() {
+  local p
+  for p in "$@"; do
+    if pkg_installed "$p"; then
+      ok "$p already installed."
+      continue
+    fi
+    info "Installing $p ..."
+    if sudo dnf install -y "$p"; then
+      ok "$p installed."
     else
-      missing+=("$package")
+      warn "Could not install $p (skipping)."
     fi
   done
+}
 
-  if [[ ${#missing[@]} -eq 0 ]]; then
+
+ensure_basic_tools() {
+  info "Basic tools..."
+  pkg_install_each ca-certificates curl wget unzip gnupg2 tar file
+}
+
+
+ensure_env_first() {
+  info "Checking .env (one-time prompts only for missing keys)..."
+  mkdir -p data
+  touch "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+
+  local token server_id db_url allowed admin_ids admin_chat
+  local cap daily tmin tmax headless
+
+  token="$(dotenv_get BOT_TOKEN)"
+  server_id="$(dotenv_get SERVER_ID)"
+  db_url="$(dotenv_get DATABASE_URL)"
+  allowed="$(dotenv_get ALLOWED_USER_IDS)"
+  admin_ids="$(dotenv_get ADMIN_USER_IDS)"
+  admin_chat="$(dotenv_get ADMIN_CHAT_ID)"
+  cap="$(dotenv_get CHAPTER_CAP)"
+  daily="$(dotenv_get DAILY_TASK_LIMIT)"
+  tmin="$(dotenv_get CHAPTER_THROTTLE_MIN)"
+  tmax="$(dotenv_get CHAPTER_THROTTLE_MAX)"
+  headless="$(dotenv_get HEADLESS)"
+
+  if [[ "$IS_INTERACTIVE" -eq 0 ]]; then
+    if [[ -z "$token" || "$token" == *"your_token"* ]]; then
+      err "Non-interactive: set BOT_TOKEN in .env or environment."
+      exit 1
+    fi
+    [[ -n "$server_id" ]] || dotenv_set SERVER_ID "s1"
+    ok ".env present (non-interactive)."
     return
   fi
 
-  info "Installing: ${missing[*]}"
+  local need_wizard=0
+  if [[ -z "$token" || "$token" == *"your_token"* ]]; then need_wizard=1; fi
+  if [[ -z "$server_id" ]]; then need_wizard=1; fi
 
-  if [[ $PKG_UPDATED -eq 0 ]]; then
-    sudo dnf -y makecache || true
-    PKG_UPDATED=1
+  if [[ "$need_wizard" -eq 0 ]]; then
+    ok "BOT_TOKEN and SERVER_ID already set — skipping prompts."
+    ok "  SERVER_ID=$server_id  (edit .env or /set to change)"
+    [[ -n "$(dotenv_get CLOUDFLARED_BIN)" ]] || dotenv_set CLOUDFLARED_BIN "$CLOUDFLARED_BIN_PATH"
+    [[ -n "$(dotenv_get NOVNC_WEB_DIR)" ]] || dotenv_set NOVNC_WEB_DIR "$NOVNC_DIR"
+    [[ -n "$(dotenv_get CHROME_PROFILE_DIR)" ]] || dotenv_set CHROME_PROFILE_DIR "data/chrome-profile"
+    return
   fi
-  sudo dnf install -y "${missing[@]}"
+
+  echo
+  echo "=========================================="
+  echo "   First-time .env setup (one time only)"
+  echo "=========================================="
+  echo "Later: edit .env or use bot /set — this script will not ask again."
+  echo
+
+  if [[ -z "$token" || "$token" == *"your_token"* ]]; then
+    token="${BOT_TOKEN:-}"
+    while true; do
+      prompt_or_env token "BOT_TOKEN (required)" ""
+      [[ -n "$token" ]] && break
+      warn "Token required."
+    done
+    dotenv_set BOT_TOKEN "$token"
+  else
+    ok "BOT_TOKEN already set."
+  fi
+
+  if [[ -z "$server_id" ]]; then
+    server_id="${SERVER_ID:-}"
+    echo
+    echo "SERVER_ID — unique id for this machine."
+    echo "  s1     = coordinator (by convention)"
+    echo "  s2-s10 = workers"
+    prompt_or_env server_id "SERVER_ID" "s1"
+    server_id="$(echo "$server_id" | tr '[:upper:]' '[:lower:]' | xargs)"
+    [[ -n "$server_id" ]] || server_id="s1"
+    dotenv_set SERVER_ID "$server_id"
+  else
+    ok "SERVER_ID already set: $server_id"
+  fi
+
+  if [[ -z "$db_url" ]]; then
+    echo
+    echo "DATABASE_URL — leave empty for local SQLite."
+    echo "Multi-worker: postgresql://user:pass@COORD_PRIVATE_IP:5432/wtr"
+    db_url="${DATABASE_URL:-}"
+    prompt_or_env db_url "DATABASE_URL (optional)" ""
+    dotenv_set DATABASE_URL "$db_url"
+  else
+    ok "DATABASE_URL already set (not re-prompting)."
+  fi
+
+  if [[ -z "$cap" ]]; then
+    prompt_or_env allowed "ALLOWED_USER_IDS (optional)" ""
+    prompt_or_env admin_ids "ADMIN_USER_IDS (optional)" ""
+    prompt_or_env admin_chat "ADMIN_CHAT_ID (optional)" ""
+    prompt_or_env cap "CHAPTER_CAP" "0"
+    prompt_or_env daily "DAILY_TASK_LIMIT" "0"
+    prompt_or_env tmin "CHAPTER_THROTTLE_MIN" "18"
+    prompt_or_env tmax "CHAPTER_THROTTLE_MAX" "24"
+    prompt_or_env headless "HEADLESS (0=visible for Turnstile)" "0"
+    dotenv_set ALLOWED_USER_IDS "$allowed"
+    dotenv_set ADMIN_USER_IDS "$admin_ids"
+    dotenv_set ADMIN_CHAT_ID "$admin_chat"
+    dotenv_set OUTPUT_GROUPS ""
+    dotenv_set CHAPTER_CAP "${cap:-0}"
+    dotenv_set DAILY_TASK_LIMIT "${daily:-0}"
+    dotenv_set CHAPTER_THROTTLE_MIN "${tmin:-18}"
+    dotenv_set CHAPTER_THROTTLE_MAX "${tmax:-24}"
+    dotenv_set PROGRESS_UPDATE_SECONDS "25"
+    dotenv_set HEADLESS "${headless:-0}"
+  fi
+
+  dotenv_set CHROME_PROFILE_DIR "data/chrome-profile"
+  dotenv_set CLOUDFLARED_BIN "$CLOUDFLARED_BIN_PATH"
+  dotenv_set NOVNC_WEB_DIR "$NOVNC_DIR"
+  dotenv_set VNC_PORT "$VNC_PORT"
+  dotenv_set NOVNC_PORT "$NOVNC_PORT"
+
+  ok ".env ready (SERVER_ID=$(dotenv_get SERVER_ID))."
 }
 
 
-# =========================================================
-# BASIC TOOLS
-# =========================================================
-
-ensure_basic_tools() {
-  info "Checking required system tools..."
-  pkg_install ca-certificates curl wget unzip gnupg2
-  ok "Basic system tools ready."
-}
-
-
-# =========================================================
-# PYTHON
-# =========================================================
-
-python_version_ok() {
-  command -v python3 >/dev/null 2>&1 || return 1
-  python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null
+pick_python_bin() {
+  local cand
+  for cand in python3.12 python3.11 python3.10 python3; do
+    if command -v "$cand" >/dev/null 2>&1; then
+      if "$cand" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+        echo "$cand"
+        return 0
+      fi
+    fi
+  done
+  return 1
 }
 
 
 ensure_python() {
-  if python_version_ok; then
-    ok "Python: $(python3 --version)"
-  else
-    warn "Python 3.10+ not found (or too old). Installing..."
-
-    # OL9 / RHEL9: python3 is usually recent enough.
-    # OL8 may need module streams.
-    pkg_install python3 python3-pip python3-devel || true
-
-    if ! python_version_ok; then
-      info "Trying Python module streams (Oracle Linux 8 style)..."
-      sudo dnf module enable -y python39 2>/dev/null || true
-      sudo dnf module enable -y python3.11 2>/dev/null || true
-      sudo dnf module enable -y python3.12 2>/dev/null || true
-      sudo dnf install -y python39 python39-pip python39-devel 2>/dev/null || true
-      sudo dnf install -y python3.11 python3.11-pip python3.11-devel 2>/dev/null || true
-      sudo dnf install -y python3.12 python3.12-pip python3.12-devel 2>/dev/null || true
-
-      for cand in python3.12 python3.11 python3.10 python3.9 python3; do
-        if command -v "$cand" >/dev/null 2>&1; then
-          if "$cand" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
-            export WTR_PYTHON_BIN="$cand"
-            break
-          fi
-        fi
-      done
-    fi
-
-    # Build deps some pip wheels need
-    pkg_install gcc gcc-c++ make libffi-devel openssl-devel 2>/dev/null || true
+  local bin=""
+  bin="$(pick_python_bin 2>/dev/null || true)"
+  if [[ -n "$bin" ]]; then
+    export WTR_PYTHON_BIN="$bin"
+    ok "Python: $($bin --version 2>&1) ($bin)"
+    return
   fi
-
-  if [[ -z "${WTR_PYTHON_BIN:-}" ]]; then
-    if command -v python3 >/dev/null 2>&1; then
-      WTR_PYTHON_BIN="python3"
-    else
-      err "python3 is not available after install attempts."
-      exit 1
-    fi
-  fi
-
-  local ver
-  ver="$("$WTR_PYTHON_BIN" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
-  ok "Using $WTR_PYTHON_BIN ($ver) for the virtual environment."
-
-  if ! "$WTR_PYTHON_BIN" -m venv --help >/dev/null 2>&1; then
-    info "Ensuring venv module is available..."
-    pkg_install python3 || true
-  fi
-
-  if ! "$WTR_PYTHON_BIN" -m venv --help >/dev/null 2>&1; then
-    err "Python venv module is not available ($WTR_PYTHON_BIN -m venv failed)."
-    err "On Oracle Linux 8 try: sudo dnf module install -y python39"
-    exit 1
-  fi
-
-  if ! "$WTR_PYTHON_BIN" -m pip --version >/dev/null 2>&1; then
-    pkg_install python3-pip || true
-  fi
-
-  ok "Python environment ready."
+  warn "Python 3.10+ missing — installing..."
+  pkg_install_each python3 python3-pip python3-devel
+  pkg_install_each python3.12 python3.12-pip python3.12-devel
+  pkg_install_each python3.11 python3.11-pip python3.11-devel
+  pkg_install_each gcc gcc-c++ make libffi-devel openssl-devel
+  bin="$(pick_python_bin 2>/dev/null || true)"
+  export WTR_PYTHON_BIN="${bin:-python3}"
+  command -v "$WTR_PYTHON_BIN" >/dev/null || { err "No python"; exit 1; }
+  ok "Using $WTR_PYTHON_BIN"
 }
 
 
-# =========================================================
-# GOOGLE CHROME
-# =========================================================
+ensure_venv() {
+  if [[ -x "$VENV_PY" ]] && "$VENV_PY" -m pip --version >/dev/null 2>&1; then
+    ok "venv OK."
+    return
+  fi
+  [[ -d .venv ]] && rm -rf .venv
+  info "Creating .venv..."
+  "${WTR_PYTHON_BIN:-python3}" -m venv .venv
+  "$VENV_PY" -m ensurepip --upgrade 2>/dev/null || true
+  "$VENV_PY" -m pip --version >/dev/null || { err "pip missing in venv"; exit 1; }
+  ok "venv created."
+}
+
+
+ensure_deps() {
+  info "pip install -r requirements.txt ..."
+  "$VENV_PY" -m pip install --upgrade pip setuptools wheel
+  "$VENV_PY" -m pip install -r "$REQ_FILE"
+  "$VENV_PY" -m pip install 'websockify>=0.11' || true
+  ok "Python deps installed."
+}
+
 
 chrome_installed() {
   command -v google-chrome >/dev/null 2>&1 \
@@ -338,392 +343,340 @@ chrome_installed() {
 }
 
 
-chrome_arch() {
-  local m
-  m="$(uname -m)"
-  case "$m" in
-    x86_64|amd64) echo "x86_64" ;;
-    aarch64|arm64) echo "aarch64" ;;
-    *) echo "$m" ;;
-  esac
-}
-
-
 ensure_chrome() {
   if chrome_installed; then
-    CHROME_CMD="$(command -v google-chrome || command -v google-chrome-stable)"
-    ok "Google Chrome found: $CHROME_CMD"
+    ok "Google Chrome: $(command -v google-chrome || command -v google-chrome-stable)"
     return
   fi
-
-  local arch
-  arch="$(chrome_arch)"
-  if [[ "$arch" != "x86_64" ]]; then
-    err "Google Chrome official packages are only published for x86_64."
-    err "This VPS architecture is: $arch"
-    err "Use an x86_64 (AMD/Intel) shape, or install Chromium another way."
-    exit 1
-  fi
-
-  warn "Google Chrome not found."
-  info "Installing Google Chrome..."
-
   local tmp_rpm
   tmp_rpm="$(mktemp --suffix=.rpm)"
-  cleanup_chrome_rpm() { rm -f "$tmp_rpm"; }
-  trap cleanup_chrome_rpm EXIT
-
-  info "Downloading Google Chrome RPM..."
-  curl -fL \
-    "https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm" \
-    -o "$tmp_rpm"
-
-  info "Installing Google Chrome (dnf will pull dependencies)..."
-  sudo dnf install -y "$tmp_rpm"
-
-  rm -f "$tmp_rpm"
-  trap - EXIT
-
-  if chrome_installed; then
-    CHROME_CMD="$(command -v google-chrome || command -v google-chrome-stable)"
-    ok "Google Chrome installed: $CHROME_CMD"
-  else
-    err "Google Chrome installation failed."
-    exit 1
-  fi
-}
-
-
-# =========================================================
-# VIRTUAL ENVIRONMENT
-# =========================================================
-
-ensure_venv() {
-  if [[ -x "$VENV_PY" ]] && \
-     "$VENV_PY" -m pip --version >/dev/null 2>&1; then
-    ok "Virtual environment exists and pip is available."
-    return
-  fi
-
-  if [[ -d ".venv" ]]; then
-    warn "Existing virtual environment is incomplete or missing pip."
-    info "Recreating .venv..."
-    rm -rf .venv
-  else
-    info "Creating virtual environment..."
-  fi
-
-  local pybin="${WTR_PYTHON_BIN:-python3}"
-  "$pybin" -m venv .venv
-
-  if [[ ! -x "$VENV_PY" ]]; then
-    err "Failed to create .venv with $pybin."
-    exit 1
-  fi
-
-  if ! "$VENV_PY" -m pip --version >/dev/null 2>&1; then
-    warn "pip missing inside venv — bootstrapping with ensurepip..."
-    "$VENV_PY" -m ensurepip --upgrade 2>/dev/null || true
-  fi
-
-  if ! "$VENV_PY" -m pip --version >/dev/null 2>&1; then
-    err "Could not install pip into the virtual environment."
-    exit 1
-  fi
-
-  ok "Virtual environment created with pip."
-}
-
-
-# =========================================================
-# PYTHON DEPENDENCIES
-# =========================================================
-
-ensure_deps() {
-  info "Installing / updating Python packages..."
-  info "This may take a few minutes (seleniumbase pulls ChromeDriver tooling)."
-
-  "$VENV_PY" -m pip install --upgrade pip setuptools wheel
-  "$VENV_PY" -m pip install -r "$REQ_FILE"
-
-  ok "Python dependencies installed."
-}
-
-
-# =========================================================
-# ENVIRONMENT FILE
-# =========================================================
-
-ensure_env() {
-  if [[ -f "$ENV_FILE" ]] && \
-     grep -qE '^BOT_TOKEN=.+' "$ENV_FILE" && \
-     ! grep -q 'your_token_here' "$ENV_FILE"; then
-    ok ".env already configured."
-    return
-  fi
-
-  require_token_noninteractive
-
-  if [[ -f "$ENV_FILE" ]]; then
-    warn ".env exists but BOT_TOKEN looks empty / placeholder."
-    warn "Reconfiguring .env..."
-  fi
-
-  local token="${BOT_TOKEN:-}"
-  local allowed="${ALLOWED_USER_IDS:-}"
-  local admin_ids="${ADMIN_USER_IDS:-}"
-  local admin_chat="${ADMIN_CHAT_ID:-}"
-  local cap="${CHAPTER_CAP:-0}"
-  local daily="${DAILY_TASK_LIMIT:-0}"
-  local tmin="${CHAPTER_THROTTLE_MIN:-18}"
-  local tmax="${CHAPTER_THROTTLE_MAX:-24}"
-  local headless="${HEADLESS:-1}"
-
-  if [[ "$IS_INTERACTIVE" -eq 1 ]]; then
-    echo
-    echo "=========================================="
-    echo "          Configure your bot"
-    echo "=========================================="
-    echo
-    echo "Create a bot with @BotFather in Telegram,"
-    echo "then paste the bot token below."
-    echo
-
-    while true; do
-      prompt_or_env token "BOT_TOKEN (required)" ""
-      if [[ -n "$token" ]]; then
-        break
+  case "$ARCH" in
+    x86_64|amd64)
+      info "Downloading Chrome x86_64 RPM..."
+      curl -fL "https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm" -o "$tmp_rpm"
+      sudo dnf install -y "$tmp_rpm" || true
+      ;;
+    aarch64|arm64)
+      info "Downloading Chrome aarch64 RPM..."
+      if curl -fL "https://dl.google.com/linux/direct/google-chrome-stable_current_aarch64.rpm" -o "$tmp_rpm" 2>/dev/null; then
+        sudo dnf install -y "$tmp_rpm" || true
+      elif curl -fL "https://dl.google.com/linux/direct/google-chrome-stable_current_arm64.rpm" -o "$tmp_rpm" 2>/dev/null; then
+        sudo dnf install -y "$tmp_rpm" || true
+      else
+        err "Chrome ARM RPM not available."
+        rm -f "$tmp_rpm"
+        exit 1
       fi
-      warn "Token is required."
-    done
-
-    echo
-    echo "ALLOWED_USER_IDS — numeric Telegram ID(s)."
-    echo "Comma-separated if there are multiple."
-    echo "Leave empty to allow anyone who finds the bot."
-    prompt_or_env allowed "ALLOWED_USER_IDS (optional)" ""
-
-    echo
-    echo "ADMIN_USER_IDS — immune to chapter/daily limits (optional)."
-    prompt_or_env admin_ids "ADMIN_USER_IDS (optional)" ""
-
-    echo
-    echo "ADMIN_CHAT_ID — receives copies of finished books (optional)."
-    prompt_or_env admin_chat "ADMIN_CHAT_ID (optional)" ""
-
-    echo
-    echo "CHAPTER_CAP — maximum chapters per download (0 = unlimited)."
-    prompt_or_env cap "CHAPTER_CAP" "0"
-    [[ "$cap" =~ ^[0-9]+$ ]] || cap="0"
-
-    echo
-    echo "DAILY_TASK_LIMIT — max new tasks per user per day (0 = unlimited)."
-    prompt_or_env daily "DAILY_TASK_LIMIT" "0"
-    [[ "$daily" =~ ^[0-9]+$ ]] || daily="0"
-
-    echo
-    echo "Chapter delay in seconds (defaults 18–24 are safer vs Cloudflare)."
-    prompt_or_env tmin "CHAPTER_THROTTLE_MIN" "18"
-    prompt_or_env tmax "CHAPTER_THROTTLE_MAX" "24"
-
-    echo
-    echo "HEADLESS — 1 = no Chrome window (recommended on a VPS),"
-    echo "           0 = visible window (needs display / VNC for Turnstile)."
-    prompt_or_env headless "HEADLESS" "1"
-  else
-    info "Non-interactive mode: writing .env from environment variables / defaults."
-    if [[ -z "$token" ]]; then
-      err "BOT_TOKEN is empty in non-interactive mode."
+      ;;
+    *)
+      err "Unsupported arch: $ARCH"
+      rm -f "$tmp_rpm"
       exit 1
+      ;;
+  esac
+  rm -f "$tmp_rpm"
+  chrome_installed || { err "Chrome install failed"; exit 1; }
+  ok "Google Chrome installed."
+}
+
+
+uc_driver_path() {
+  local p
+  p="$("$VENV_PY" -c 'import pathlib, seleniumbase; print(pathlib.Path(seleniumbase.__file__).parent / "drivers" / "uc_driver")' 2>/dev/null || true)"
+  if [[ -n "$p" ]]; then
+    echo "$p"
+  else
+    echo ".venv/lib/python3.12/site-packages/seleniumbase/drivers/uc_driver"
+  fi
+}
+
+
+ensure_arm_uc_driver() {
+  case "$ARCH" in
+    aarch64|arm64) ;;
+    *) return 0 ;;
+  esac
+
+  [[ -x "$VENV_PY" ]] || return 0
+
+  local dest
+  dest="$(uc_driver_path)"
+  mkdir -p "$(dirname "$dest")"
+
+  if [[ -e "$dest" ]]; then
+    local kind
+    kind="$(file -b "$dest" 2>/dev/null || true)"
+    if echo "$kind" | grep -qiE 'ARM aarch64|aarch64'; then
+      ok "uc_driver already aarch64 — not replacing."
+      return 0
     fi
+    warn "uc_driver is not aarch64 ($kind) — replacing from Chrome for Testing..."
+  else
+    info "No uc_driver yet — fetching linux-arm64 chromedriver..."
   fi
 
-  cat > "$ENV_FILE" <<EOF
-BOT_TOKEN=$token
-ALLOWED_USER_IDS=$allowed
-ADMIN_USER_IDS=$admin_ids
-OUTPUT_GROUPS=
-ADMIN_CHAT_ID=$admin_chat
-CHAPTER_CAP=$cap
-DAILY_TASK_LIMIT=$daily
-CHAPTER_THROTTLE_MIN=$tmin
-CHAPTER_THROTTLE_MAX=$tmax
-PROGRESS_UPDATE_SECONDS=25
-CHROME_PROFILE_DIR=data/chrome-profile
-HEADLESS=$headless
+  if ! chrome_installed; then
+    warn "Chrome not installed; skip ARM driver fetch."
+    return 0
+  fi
+
+  local ver
+  ver="$(google-chrome --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+  [[ -n "$ver" ]] || ver="$(google-chrome-stable --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+  if [[ -z "$ver" ]]; then
+    warn "Could not read Chrome version."
+    return 0
+  fi
+  info "Chrome version $ver — downloading chromedriver linux-arm64..."
+
+  local tmp src
+  tmp="$(mktemp -d)"
+  if ! curl -fL \
+      "https://storage.googleapis.com/chrome-for-testing-public/${ver}/linux-arm64/chromedriver-linux-arm64.zip" \
+      -o "$tmp/cd.zip"; then
+    warn "Download failed for $ver linux-arm64 chromedriver."
+    rm -rf "$tmp"
+    return 0
+  fi
+  unzip -q -o "$tmp/cd.zip" -d "$tmp"
+  src="$(find "$tmp" -type f -name chromedriver | head -1)"
+  if [[ -z "$src" || ! -f "$src" ]]; then
+    warn "chromedriver binary not found in zip."
+    rm -rf "$tmp"
+    return 0
+  fi
+  cp "$src" "$dest"
+  chmod +x "$dest"
+  rm -rf "$tmp"
+  ok "Installed aarch64 uc_driver → $dest"
+  file "$dest" || true
+}
+
+
+ensure_display_packages() {
+  info "Display / VNC packages (one at a time; no openbox)..."
+  pkg_install_each xorg-x11-server-Xvfb tigervnc-server xorg-x11-xauth mesa-libGL
+}
+
+
+ensure_novnc() {
+  if [[ -f "$NOVNC_DIR/vnc.html" ]]; then
+    ok "noVNC: $NOVNC_DIR"
+    return
+  fi
+  info "Installing noVNC..."
+  local tmp
+  tmp="$(mktemp -d)"
+  if curl -fsSL "https://github.com/novnc/noVNC/archive/refs/tags/v1.5.0.tar.gz" -o "$tmp/novnc.tgz"; then
+    tar -xzf "$tmp/novnc.tgz" -C "$tmp"
+    rm -rf "$NOVNC_DIR"
+    mv "$tmp"/noVNC-* "$NOVNC_DIR"
+    ok "noVNC installed."
+  else
+    warn "noVNC download failed."
+  fi
+  rm -rf "$tmp"
+}
+
+
+ensure_cloudflared() {
+  if command -v cloudflared >/dev/null 2>&1; then
+    ok "cloudflared: $(command -v cloudflared)"
+    dotenv_set CLOUDFLARED_BIN "$(command -v cloudflared)"
+    return
+  fi
+  if [[ -x "$CLOUDFLARED_BIN_PATH" ]]; then
+    ok "cloudflared: $CLOUDFLARED_BIN_PATH"
+    dotenv_set CLOUDFLARED_BIN "$CLOUDFLARED_BIN_PATH"
+    return
+  fi
+  info "Installing cloudflared..."
+  mkdir -p "$(dirname "$CLOUDFLARED_BIN_PATH")"
+  local url=""
+  case "$ARCH" in
+    x86_64|amd64) url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" ;;
+    aarch64|arm64) url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64" ;;
+    *) warn "No cloudflared for $ARCH"; return ;;
+  esac
+  if curl -fL "$url" -o "$CLOUDFLARED_BIN_PATH"; then
+    chmod +x "$CLOUDFLARED_BIN_PATH"
+    dotenv_set CLOUDFLARED_BIN "$CLOUDFLARED_BIN_PATH"
+    ok "cloudflared installed."
+  else
+    warn "cloudflared download failed."
+  fi
+}
+
+
+start_xvfb_if_needed() {
+  if pgrep -f "Xvfb :${DISPLAY_NUM}" >/dev/null 2>&1; then
+    ok "Xvfb :${DISPLAY_NUM} running."
+  else
+    if ! command -v Xvfb >/dev/null 2>&1; then
+      warn "Xvfb not installed."
+      return
+    fi
+    info "Starting Xvfb :${DISPLAY_NUM}..."
+    nohup Xvfb ":${DISPLAY_NUM}" -screen 0 1280x720x24 -ac +extension GLX +render -noreset \
+      >>"${HOME}/xvfb.log" 2>&1 &
+    sleep 1
+    ok "Xvfb started."
+  fi
+  export DISPLAY=":${DISPLAY_NUM}"
+}
+
+
+start_vnc_if_needed() {
+  if pgrep -x x0vncserver >/dev/null 2>&1 || ss -ltn 2>/dev/null | grep -q ":${VNC_PORT}"; then
+    ok "x0vncserver / :${VNC_PORT} up."
+    return
+  fi
+  local vnc_bin
+  vnc_bin="$(command -v x0vncserver || true)"
+  if [[ -z "$vnc_bin" ]]; then
+    warn "x0vncserver not found."
+    return
+  fi
+  info "Starting x0vncserver..."
+  nohup "$vnc_bin" -display ":${DISPLAY_NUM}" -rfbport "$VNC_PORT" \
+    -localhost yes -SecurityTypes None >>"${HOME}/x0vncserver.log" 2>&1 &
+  sleep 1
+  ok "x0vncserver started."
+}
+
+
+start_websockify_if_needed() {
+  if ss -ltn 2>/dev/null | grep -q ":${NOVNC_PORT}"; then
+    ok "websockify / :${NOVNC_PORT} up."
+    return
+  fi
+  [[ -f "$NOVNC_DIR/vnc.html" ]] || { warn "noVNC missing"; return; }
+  [[ -x "$VENV_PY" ]] || return
+  info "Starting websockify..."
+  nohup "$VENV_PY" -u -m websockify --web "$NOVNC_DIR" \
+    "127.0.0.1:${NOVNC_PORT}" "127.0.0.1:${VNC_PORT}" \
+    >>"${HOME}/websockify.log" 2>&1 &
+  sleep 1
+  ok "websockify started."
+}
+
+
+ensure_cron_watchdogs() {
+  local tmp vnc_bin
+  tmp="$(mktemp)"
+  crontab -l 2>/dev/null | grep -v 'x0vncserver' | grep -v 'websockify' | grep -v "Xvfb :${DISPLAY_NUM}" >"$tmp" || true
+  vnc_bin="$(command -v x0vncserver || echo /usr/bin/x0vncserver)"
+  cat >>"$tmp" <<EOF
+@reboot /usr/bin/Xvfb :${DISPLAY_NUM} -screen 0 1280x720x24 -ac +extension GLX +render -noreset >> ${HOME}/xvfb.log 2>&1
+@reboot sleep 2; ${vnc_bin} -display :${DISPLAY_NUM} -rfbport ${VNC_PORT} -localhost yes -SecurityTypes None >> ${HOME}/x0vncserver.log 2>&1
+@reboot sleep 3; ${PWD}/.venv/bin/python -u -m websockify --web ${NOVNC_DIR} 127.0.0.1:${NOVNC_PORT} 127.0.0.1:${VNC_PORT} >> ${HOME}/websockify.log 2>&1
+*/5 * * * * pgrep -f 'Xvfb :${DISPLAY_NUM}' >/dev/null || /usr/bin/Xvfb :${DISPLAY_NUM} -screen 0 1280x720x24 -ac +extension GLX +render -noreset >> ${HOME}/xvfb.log 2>&1
+*/5 * * * * pgrep -x x0vncserver >/dev/null || ${vnc_bin} -display :${DISPLAY_NUM} -rfbport ${VNC_PORT} -localhost yes -SecurityTypes None >> ${HOME}/x0vncserver.log 2>&1
+*/5 * * * * ss -ltn | grep -q ':${NOVNC_PORT}' || ${PWD}/.venv/bin/python -u -m websockify --web ${NOVNC_DIR} 127.0.0.1:${NOVNC_PORT} 127.0.0.1:${VNC_PORT} >> ${HOME}/websockify.log 2>&1
 EOF
-
-  chmod 600 "$ENV_FILE"
-  ok ".env written (HEADLESS=$headless)."
+  crontab "$tmp"
+  rm -f "$tmp"
+  ok "Cron watchdogs installed."
 }
 
 
-# =========================================================
-# DATA DIRECTORY / MARKER
-# =========================================================
-
-ensure_data_dir() {
-  mkdir -p data
-}
-
-
-mark_setup_done() {
-  ensure_data_dir
-  date -Iseconds > "$MARKER"
-}
-
-
+ensure_data_dir() { mkdir -p data data/chrome-profile data/library; }
+mark_setup_done() { ensure_data_dir; date -Iseconds >"$MARKER"; }
 test_setup_done() {
-  [[ -f "$MARKER" ]] &&
-  [[ -x "$VENV_PY" ]] &&
-  [[ -f "$ENV_FILE" ]] &&
-  "$VENV_PY" -m pip --version >/dev/null 2>&1
+  [[ -f "$MARKER" && -x "$VENV_PY" && -f "$ENV_FILE" ]] \
+    && "$VENV_PY" -m pip --version >/dev/null 2>&1
 }
 
-
-# =========================================================
-# FIX PERMISSIONS
-# =========================================================
 
 fix_project_permissions() {
-  if [[ "$EUID" -ne 0 ]]; then
-    local CURRENT_USER CURRENT_GROUP
-    CURRENT_USER="$(id -un)"
-    CURRENT_GROUP="$(id -gn)"
-
-    for item in .venv data "$ENV_FILE"; do
-      if [[ -e "$item" ]]; then
-        sudo chown -R "$CURRENT_USER:$CURRENT_GROUP" "$item" 2>/dev/null || true
-      fi
-    done
-  fi
+  local u g
+  u="$(id -un)"; g="$(id -gn)"
+  for item in .venv data "$ENV_FILE"; do
+    [[ -e "$item" ]] && sudo chown -R "$u:$g" "$item" 2>/dev/null || true
+  done
 }
 
-
-# =========================================================
-# STOP OTHER CHROME PROCESSES
-# =========================================================
 
 stop_chrome_if_needed() {
-  # Always clear prior worker / Chrome / driver processes so a restart is clean.
-  # Matches the operator's usual manual restart sequence.
-  info "Stopping any previous app.py / Chrome / chromedriver processes..."
-  pkill -9 -f 'app.py|uc_driver|google-chrome|chrome|chromedriver' 2>/dev/null || true
+  info "Stopping previous app.py / Chrome / driver..."
+  pkill -9 -f 'app\.py|uc_driver|google-chrome|chromedriver' 2>/dev/null || true
   sleep 2
-  ok "Previous worker/Chrome processes cleared (if any were running)."
+  ok "Cleared."
 }
 
-
-# =========================================================
-# MAIN
-# =========================================================
 
 mkdir -p data
 detect_interactive
 
 echo
 echo "=========================================="
-echo "        WTR-Lab Local Worker (dnf)"
+echo "   WTR-Lab Start (x86_64 + aarch64)"
 echo "=========================================="
 echo
-
-if [[ "$IS_INTERACTIVE" -eq 1 ]]; then
-  ok "Interactive terminal detected."
-else
-  warn "No TTY — running non-interactively."
-  warn "BOT_TOKEN must already be set in the environment or in .env."
-fi
 
 detect_os
 ensure_sudo
 ensure_basic_tools
 ensure_project
 ensure_data_dir
-
-# ---------------------------------------------------------
-# FIRST-TIME / INCOMPLETE SETUP
-# ---------------------------------------------------------
+ensure_env_first
 
 if ! test_setup_done; then
-  info "First-time (or incomplete) setup..."
-
+  info "First-time setup..."
   ensure_python
+  ensure_display_packages
   ensure_chrome
   ensure_venv
   ensure_deps
-  ensure_env
+  ensure_arm_uc_driver
+  ensure_novnc
+  ensure_cloudflared
   mark_setup_done
   fix_project_permissions
   ok "Setup complete."
 else
-  ok "Setup already done — starting worker."
-
-  ensure_chrome
-
-  if ! "$VENV_PY" -m pip --version >/dev/null 2>&1; then
-    warn "Virtual environment is no longer usable."
+  ok "Setup already done — skip installs; start services + app only."
+  if [[ ! -x "$VENV_PY" ]]; then
     ensure_python
     ensure_venv
     ensure_deps
   fi
-
-  fix_project_permissions
+  chrome_installed || ensure_chrome
+  ensure_arm_uc_driver
 fi
 
-# ---------------------------------------------------------
-# FINAL CHECKS
-# ---------------------------------------------------------
-
-ensure_chrome
-
-if [[ ! -x "$VENV_PY" ]]; then
-  err "Virtual environment Python not found."
-  ensure_python
-  ensure_venv
-  ensure_deps
-fi
-
-if [[ ! -f "$ENV_FILE" ]]; then
-  warn ".env file is missing."
-  ensure_env
-fi
-
-# ---------------------------------------------------------
-# START APP
-# ---------------------------------------------------------
+export DISPLAY=":${DISPLAY_NUM}"
+start_xvfb_if_needed
+start_vnc_if_needed
+start_websockify_if_needed
+ensure_cron_watchdogs
 
 stop_chrome_if_needed
 
 echo
 echo "=========================================="
-echo "          Starting WTR-Lab Worker"
+echo "          Starting app.py"
 echo "=========================================="
+echo
+echo "SERVER_ID=$(dotenv_get SERVER_ID)  DISPLAY=$DISPLAY  arch=$ARCH"
+if grep -qE '^HEADLESS=0' "$ENV_FILE" 2>/dev/null; then
+  echo "HEADLESS=0 — solve Turnstile over VNC, then /solved"
+else
+  echo "HEADLESS=1 — set HEADLESS=0 in .env for visible Chrome"
+fi
+echo "VNC 127.0.0.1:${VNC_PORT}  noVNC 127.0.0.1:${NOVNC_PORT}"
 echo
 
 LOG_FILE="${HOME}/bot.log"
-info "Starting app.py in background (nohup)..."
-echo
-if grep -qE '^HEADLESS=0' "$ENV_FILE" 2>/dev/null; then
-  echo "HEADLESS=0 — a Chrome window will open (needs display/VNC)."
-  echo "Solve Cloudflare Turnstile in Chrome over VNC, then send /solved in Telegram."
-else
-  echo "HEADLESS=1 — no Chrome window (good for a VPS)."
-  echo "If Cloudflare blocks downloads, set HEADLESS=0 + VNC, then /solved after clearing it."
-fi
-echo
-echo "Logs: $LOG_FILE"
-echo "  tail -f $LOG_FILE"
-echo "Stop later with:"
-echo "  pkill -9 -f 'app.py|uc_driver|google-chrome|chrome|chromedriver'"
-echo
-
+info "nohup app.py → $LOG_FILE"
 nohup "$VENV_PY" "$APP_FILE" >"$LOG_FILE" 2>&1 &
 WORKER_PID=$!
 sleep 1
 if kill -0 "$WORKER_PID" 2>/dev/null; then
-  ok "Worker started (PID $WORKER_PID)."
-  echo "Log file: $LOG_FILE"
+  ok "Started PID $WORKER_PID"
+  echo "  tail -f $LOG_FILE"
+  echo "Stop: pkill -9 -f 'app.py|uc_driver|google-chrome|chromedriver'"
 else
-  err "Worker failed to stay running. Check: $LOG_FILE"
+  err "app.py failed — see $LOG_FILE"
   exit 1
 fi
