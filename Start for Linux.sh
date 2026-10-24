@@ -27,7 +27,7 @@ CLOUDFLARED_BIN_PATH="${HOME}/bin/cloudflared"
 DISPLAY_NUM=99
 VNC_PORT=5901
 NOVNC_PORT=6080
-GITHUB_ZIP_URL="${GITHUB_ZIP_URL:-https://github.com/patrick-mulinge/WTR-Lab-crawler/archive/refs/heads/seleniumbase.zip}"
+GITHUB_ZIP_URL="${GITHUB_ZIP_URL:-https://github.com/patrick-mulinge/WTR-Lab-crawler/archive/refs/heads/eternal.zip}"
 
 IS_INTERACTIVE=0
 ARCH="$(uname -m)"
